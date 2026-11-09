@@ -52,6 +52,23 @@ export type Speech = {
   at: number
 }
 
+/**
+ * What the agents were last seen doing, by the kind of tool they called: sending
+ * mail or messages, writing files, searching or reading, running commands.
+ */
+export type ActivityKind = 'signal' | 'build' | 'scan' | 'launch'
+
+export type Activity = {
+  kind: ActivityKind
+  at: number
+}
+
+/** A one-off show in the band: meteors when an agent fails, a rocket when the flow finishes. */
+export type Flash = {
+  kind: 'meteor' | 'liftoff'
+  at: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'savvy-progress': {
@@ -62,6 +79,14 @@ declare module 'claude-code' {
       say: Speech | null
       /** When Clawd last spoke; idle chatter waits IDLE_MS after it. */
       spokeAt: number
+      /** Clawd acts it out beside the band while it is fresh (ACTIVITY_MS). */
+      activity: Activity | null
+      /** Shown for FLASH_MS after it happens. */
+      flash: Flash | null
+      /** When the main session last answered: the prompt cache's clock starts there. */
+      answeredAt: number
+      /** The cache is close to expiring and nothing runs: Clawd dozes. */
+      isSleepy: boolean
     }
   }
 }
