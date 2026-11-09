@@ -21,7 +21,7 @@ const IDLE_MS = 5 * 60_000
 
 // What the agents are doing, from the tools they call, for Clawd to act out.
 const activity = atom({ plugin: 'savvy-progress', key: 'activity' } as const, null as Activity | null)
-const ACTIVITY_MS = 20_000
+const ACTIVITY_MS = 8_000
 
 // One-off shows: meteors when an agent fails, a rocket when the flow finishes.
 const flash = atom({ plugin: 'savvy-progress', key: 'flash' } as const, null as Flash | null)
@@ -121,6 +121,7 @@ const STRINGS = {
     actBuild: 'BUILDING',
     actScan: 'SCANNING',
     actLaunch: 'RUNNING',
+    actThink: 'THINKING',
     taskDone: 'Done',
     taskFailed: 'Hit a snag',
     allDone: 'All done! Nice work',
@@ -196,6 +197,7 @@ const STRINGS = {
     actBuild: 'СТРОЮ',
     actScan: 'ПОИСК',
     actLaunch: 'ЗАПУСК',
+    actThink: 'ДУМАЮ',
     taskDone: 'Готово',
     taskFailed: 'Что-то пошло не так',
     allDone: 'Всё готово! Отличная работа',
@@ -250,6 +252,7 @@ const STRINGS = {
     actBuild: 'בונה',
     actScan: 'סורק',
     actLaunch: 'מריץ',
+    actThink: 'חושב',
     taskDone: 'הושלם',
     taskFailed: 'משהו השתבש',
     allDone: 'הכול מוכן! עבודה יפה',
@@ -459,7 +462,27 @@ const skyMotion = (W: number): string => `.tw{animation:tw 2.4s ease-in-out infi
 .look{animation:look 3s ease-in-out infinite}@keyframes look{50%{transform:rotate(-12deg)}}
 .rocket{animation:fly 1.8s ease-in infinite}@keyframes fly{0%{transform:translateY(4px);opacity:0}15%{opacity:1}100%{transform:translateY(-14px);opacity:0}}
 .flame{animation:flame .2s steps(1) infinite}@keyframes flame{50%{transform:scaleY(.6)}}
-@media (prefers-reduced-motion: reduce){.tw,.shoot,.swirl,.wave,.hammer,.spark,.glint,.look,.rocket,.flame{animation:none}}`
+.orb{transform-box:fill-box;transform-origin:center;animation:orb 1.8s ease-in-out infinite}@keyframes orb{50%{transform:scale(1.35);opacity:.75}}
+.orbit{animation:orbit 2.4s linear infinite}@keyframes orbit{to{transform:rotate(360deg)}}
+.orbit2{animation:orbit 3.6s linear infinite reverse}
+.bub{opacity:0;animation:bub 1.8s ease-in-out infinite}@keyframes bub{0%,10%{opacity:0}35%,70%{opacity:1}100%{opacity:0}}
+.link{stroke-dasharray:3 3;animation:link 1.2s linear infinite}@keyframes link{to{stroke-dashoffset:-12}}
+@media (prefers-reduced-motion: reduce){.tw,.shoot,.swirl,.wave,.hammer,.spark,.glint,.look,.rocket,.flame,.orb,.orbit,.orbit2,.bub,.link{animation:none}.bub{opacity:1}}`
+
+// Clawd thinking, while Claude works between tools: thought bubbles rise from its helmet
+// to a pulsing mind-star, which two moons orbit and dashed lines link to nearby stars.
+const skyThink = (x: number, Hh: number): string => {
+  const cy = Hh / 2
+  const ox = x + 10
+  const oy = cy - 5
+  return `<defs><radialGradient id="mind"><stop offset="0" stop-color="#fff"/><stop offset=".35" stop-color="#E9D5FF"/><stop offset=".7" stop-color="#8B5CF6" stop-opacity=".55"/><stop offset="1" stop-color="#8B5CF6" stop-opacity="0"/></radialGradient></defs>
+<path class="link" d="M${ox} ${oy}L${x + 1} ${cy - 13}M${ox} ${oy}L${x - 2} ${cy + 3}" stroke="${SKY_LILAC}" stroke-opacity=".6" stroke-width=".6" fill="none"/>
+<circle class="tw" cx="${x + 1}" cy="${cy - 13}" r=".9" fill="#E9D5FF"/><circle class="tw" style="animation-delay:.8s" cx="${x - 2}" cy="${cy + 3}" r=".9" fill="#E9D5FF"/>
+<g transform="translate(${ox} ${oy}) scale(1 .38)"><ellipse rx="9" ry="9" fill="none" stroke="#C4B5FD" stroke-opacity=".35" stroke-width="1.2"/><g class="orbit"><circle cx="9" r="2.4" fill="${SKY_GOLD}"/></g><g class="orbit2"><circle cx="-6" r="1.8" fill="#C4B5FD"/></g></g>
+<circle cx="${ox}" cy="${oy}" r="7" fill="url(#mind)" opacity=".7"/>
+<circle class="orb" cx="${ox}" cy="${oy}" r="2.6" fill="#fff"/>
+${[[x + 23, cy + 7, 0.9], [x + 20, cy + 3, 1.3], [x + 16, cy - 0.5, 1.7]].map(([bx, by, r], i) => `<circle class="bub" style="animation-delay:${(i * 0.3).toFixed(1)}s" cx="${bx}" cy="${by}" r="${r}" fill="#F4EFE6" stroke="#8B5CF6" stroke-opacity=".6" stroke-width=".5"/>`).join('')}`
+}
 
 // Clawd's prop for what the agents are doing, in a 26×H box at x: a satellite beaming
 // signal arcs (mail and messages), a hammer shaping a space rock (writing files), a
@@ -602,9 +625,11 @@ const bandSvg = (all: Readout[], pct: number | null, state: BandState, W: number
   const isDone = state === 'complete'
   const crabW = CRAB_BOX * BAND_CRAB
   const doing = live ? act : null
-  const PROP_W = doing ? 28 : 0
+  // Working with no tool in hand: Claude is thinking.
+  const thinking = live && !doing
+  const PROP_W = doing || thinking ? 28 : 0
   const ACT_WORD: Record<ActivityKind, string> = { signal: s.actSignal, build: s.actBuild, scan: s.actScan, launch: s.actLaunch }
-  const status = doing ? ACT_WORD[doing] : state === 'working' ? s.working : isDone ? s.complete : s.standby
+  const status = doing ? ACT_WORD[doing] : thinking ? s.actThink : isDone ? s.complete : s.standby
   const statusW = mono(status, 9) + status.length * 1.5 + 18
   // Readouts that would run under the status or Clawd are left out, from the end.
   const GAUGE = 70
@@ -660,7 +685,7 @@ ${parts.join('')}
 ${mark}
 <text class="st" x="${sx + 12}" y="${H / 2 + 3.2}" font-family="${HUD}" font-size="9" letter-spacing="1.5">${xml(status)}</text>
 </g>
-${doing ? skyProp(doing, W - crabW - 10 - PROP_W, H) : ''}
+${doing ? skyProp(doing, W - crabW - 10 - PROP_W, H) : thinking ? skyThink(W - crabW - 10 - PROP_W, H) : ''}
 ${CRAB_CSS}${crab(W - crabW - 8, H / 2 - 14, 'fable', sleepy && !live, live, BAND_CRAB)}
 ${sleepy && !live && !speech ? skyZzz(W - crabW - 15, H / 2 - 5) : ''}
 ${show ? skyFlash(show, W, H) : ''}
