@@ -1431,6 +1431,9 @@ export const register: Register = (on, options) => {
     } else {
       // The main session answered: the prompt cache starts its hour again, and Clawd wakes.
       const at = await $.clock.now()
+      // A task (a turn that used tools) just finished: Clawd says so.
+      const act = await read($, activity)
+      if (act && act.at > (await read($, answeredAt))) await speak($, tr().taskDone)
       await update($, answeredAt, () => at)
       if (await read($, isSleepy)) await update($, isSleepy, () => false)
     }
@@ -1615,9 +1618,10 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const f = await read($, flow)
     const list = await read($, agents)
-    const isWorking = list.some(a => a.status === 'running')
-    // Up while a flow is reported or any agent runs.
-    if ((f === null && !isWorking) || e.props.hasSurvey) return next(e)
+    // Working while Claude itself is on a task, or while any agent runs.
+    const isWorking = !!e.props.isWorking || list.some(a => a.status === 'running')
+    // Always up; between tasks it rests without motion.
+    if (e.props.hasSurvey) return next(e)
     // Draw this row with the other mods' bands beneath it. Claude Code's own placeholder ({ type: 'engine' }) is
     // never nested: the desktop drops a band that nests it.
     const drawn = await Promise.resolve(next(e)).catch(() => null)
