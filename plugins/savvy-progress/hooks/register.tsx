@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRun, Flow, Panel, Phase, PlannedTask, Speech } from '../types'
+import type { Activity, ActivityKind, AgentRun, Flash, Flow, Panel, Phase, PlannedTask, Speech } from '../types'
 
 const flow = atom({ plugin: 'savvy-progress', key: 'flow' } as const, null)
 const agents = atom({ plugin: 'savvy-progress', key: 'agents' } as const, [])
@@ -18,6 +18,32 @@ const spokeAt = atom({ plugin: 'savvy-progress', key: 'spokeAt' } as const, 0)
 // waits before Clawd says something on its own.
 const SAY_MS = 8_000
 const IDLE_MS = 5 * 60_000
+
+// What the agents are doing, from the tools they call, for Clawd to act out.
+const activity = atom({ plugin: 'savvy-progress', key: 'activity' } as const, null as Activity | null)
+const ACTIVITY_MS = 20_000
+
+// One-off shows: meteors when an agent fails, a rocket when the flow finishes.
+const flash = atom({ plugin: 'savvy-progress', key: 'flash' } as const, null as Flash | null)
+const FLASH_MS = 7_000
+
+// The prompt cache lives an hour after the main session's last answer; in its last
+// SLEEPY_MS, with nothing running, Clawd dozes off.
+const answeredAt = atom({ plugin: 'savvy-progress', key: 'answeredAt' } as const, 0)
+const isSleepy = atom({ plugin: 'savvy-progress', key: 'isSleepy' } as const, false)
+const CACHE_TTL_MS = 60 * 60_000
+const SLEEPY_MS = 10 * 60_000
+
+// Sending mail or messages beams a signal; writing files builds; searching and
+// reading scan; running commands or starting agents launch. Other tools change nothing.
+const activityOf = (tool: string): ActivityKind | null => {
+  const t = tool.toLowerCase()
+  if (/send|reply|forward|draft|post_?message|push_?notification/.test(t)) return 'signal'
+  if (/^(write|edit|notebookedit)$|create_file|update_file|upload/.test(t)) return 'build'
+  if (/^(read|grep|glob|websearch|webfetch)$|search|fetch|read_|get_|list_|query/.test(t)) return 'scan'
+  if (/^(bash|powershell|agent)$|run_|execute/.test(t)) return 'launch'
+  return null
+}
 
 const TOOL = 'mcp__savvy-progress__progress'
 const STEP_TOOL = 'mcp__savvy-progress__step'
@@ -91,9 +117,14 @@ const STRINGS = {
     working: 'WORKING',
     standby: 'STANDBY',
     complete: 'COMPLETE',
+    actSignal: 'SENDING',
+    actBuild: 'BUILDING',
+    actScan: 'SCANNING',
+    actLaunch: 'RUNNING',
     taskDone: 'Done',
     taskFailed: 'Hit a snag',
     allDone: 'All done! Nice work',
+    // One every 5 minutes while nothing runs, in order, so none repeats for over two hours.
     idle: [
       'Still here if you need me',
       'Tiny crab, big plans',
@@ -102,7 +133,27 @@ const STRINGS = {
       'I polished the progress bar',
       'Sideways is my favorite direction',
       'You’re doing great',
-      'Counting bubbles… 41, 42…',
+      'Counting stars… 41, 42…',
+      'Floating. Very professional.',
+      'This helmet fogs up when I think hard',
+      'Spotted a black hole. Waved. It didn’t wave back',
+      'Zero gravity, zero bugs. Hopefully',
+      'Orbiting your project. Looks nice from here',
+      'Fun fact: crabs are great astronauts',
+      'Tidying the asteroid belt',
+      'Naming a star after you',
+      'My antenna picks up good vibes',
+      'Hydrated? Space crabs drink water too',
+      'Moonwalking. Sideways, of course',
+      'Ground control, all quiet here',
+      'Charting a course for your next idea',
+      'Collected 3 space rocks. Want one?',
+      'The galaxy says hi',
+      'Mission log: still adorable',
+      'Ready for liftoff whenever you are',
+      'Is it snack time on Earth?',
+      'Stargazing until you need me',
+      'Every big project starts tiny. Like me',
     ],
   },
   ru: {
@@ -141,6 +192,10 @@ const STRINGS = {
     working: 'РАБОТАЕТ',
     standby: 'ОЖИДАНИЕ',
     complete: 'ГОТОВО',
+    actSignal: 'ОТПРАВКА',
+    actBuild: 'СТРОЮ',
+    actScan: 'ПОИСК',
+    actLaunch: 'ЗАПУСК',
     taskDone: 'Готово',
     taskFailed: 'Что-то пошло не так',
     allDone: 'Всё готово! Отличная работа',
@@ -191,6 +246,10 @@ const STRINGS = {
     working: 'פועל',
     standby: 'בהמתנה',
     complete: 'הושלם',
+    actSignal: 'שולח',
+    actBuild: 'בונה',
+    actScan: 'סורק',
+    actLaunch: 'מריץ',
     taskDone: 'הושלם',
     taskFailed: 'משהו השתבש',
     allDone: 'הכול מוכן! עבודה יפה',
@@ -296,10 +355,10 @@ const ratio = (f: Flow): number => (f.isFinished ? 1 : f.total ? f.done / f.tota
 // so the gauge, readouts, status, crab and its callout live in one drawing; only
 // the count and the dismiss are Buttons beside it. Nothing moves unless an agent
 // is running.
-const H = 44
+const H = 46
 // The crab's drawing grid is 30 units wide, props included.
 const CRAB_BOX = 30
-const BAND_CRAB = 0.62
+const BAND_CRAB = 0.7
 const FONT = "-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-serif"
 const HUD = "'Cascadia Mono','SF Mono',Consolas,ui-monospace,monospace"
 
@@ -330,9 +389,9 @@ const fitText = (s: string, size: number, maxW: number): string => {
   return out + '…'
 }
 
-// JARVIS-style panel: cyan data on a dark glass field lit from its rim, a
-// reticle gauge of layered rings, and labeled readouts. The panel is dark in
-// both themes, as a HUD is. Amber marks Clawd's callouts.
+// The band: a galaxy panel that blends into Claude (its background and text colors,
+// a faint haze and stars), a ringed planet as the progress gauge, labeled readouts,
+// a status word and Clawd the astronaut with a speech bubble.
 type Readout = { label: string; value: string }
 type BandState = 'working' | 'standby' | 'complete'
 
@@ -351,127 +410,264 @@ const bandReadouts = (f: Flow | null, list: AgentRun[], at: number): Readout[] =
   return out
 }
 
-const CELL_PAD = 14
-const cellWidth = (r: Readout): number => Math.max(textWidth(r.label.toUpperCase(), 8.5) + r.label.length * 1.6, textWidth(r.value, 13) * 1.05) + CELL_PAD * 2
+const CELL_PAD = 12
+const mono = (s: string, size: number): number => [...s].length * size * 0.62
+const cellWidth = (r: Readout): number => Math.max(mono(r.label.toUpperCase(), 8) + r.label.length * 1.5, mono(r.value, 12)) + CELL_PAD * 2
 
-// The reticle: a ticked outer ring, a segmented middle ring, the progress arc
-// and the percent at its heart. While working the rings turn against each other.
-const reticle = (cx: number, cy: number, pct: number | null): string => {
-  const ticks = Array.from({ length: 36 }, (_, i) => {
-    const a = (i * Math.PI) / 18
-    const r0 = i % 3 ? 15.5 : 14
-    return `M${(cx + Math.cos(a) * r0).toFixed(2)} ${(cy + Math.sin(a) * r0).toFixed(2)}L${(cx + Math.cos(a) * 17).toFixed(2)} ${(cy + Math.sin(a) * 17).toFixed(2)}`
-  }).join('')
-  const R = 11
-  const C = 2 * Math.PI * R
-  const arc =
-    pct === null
-      ? ''
-      : `<circle class="arc" cx="${cx}" cy="${cy}" r="${R}" stroke-dasharray="${(C * pct).toFixed(2)} ${C.toFixed(2)}" transform="rotate(-90 ${cx} ${cy})"/>`
-  return `<g class="rt1"><path class="tick" d="${ticks}"/></g>
-<circle class="ring" cx="${cx}" cy="${cy}" r="${R}"/>${arc}
-<g class="rt2"><circle class="seg" cx="${cx}" cy="${cy}" r="7.5" stroke-dasharray="9.8 2"/></g>
-<text class="pv" x="${cx}" y="${cy + 3}" text-anchor="middle" font-family="${HUD}" font-size="8.5">${pct === null ? '—' : Math.round(pct * 100)}</text>`
+// Galaxy look, matching session-band's: Claude's own background and text colors in
+// light and dark mode, a faint galaxy haze with stars, and Claude's clay as accent.
+const SKY_CLAY = '#D97757'
+const SKY_LILAC = '#8B5CF6'
+const SKY_GOLD = '#E8A15E'
+
+// Deterministic noise: the same seed draws the same sky on every redraw.
+const skyRand = (i: number, k: number): number => {
+  const s = Math.sin(i * 12.9898 + k * 78.233) * 43758.5453
+  return s - Math.floor(s)
 }
 
-// `speech` is what Clawd says in a callout beside it, if anything.
-const bandSvg = (all: Readout[], pct: number | null, state: BandState, W: number, speech = ''): string => {
-  // Positions are worked out left to right; right to left mirrors each box (`rx`).
-  const rtl = isRtl()
-  const rx = (x: number, w: number): number => (rtl ? W - x - w : x)
+// A seed for this session's sky, from its id.
+const skySeed = (id: string): number => [...id].reduce((h, ch) => (h * 31 + ch.charCodeAt(0)) % 9973, 7)
+
+const skyStars = (W: number, Hh: number, seed: number): string =>
+  Array.from({ length: Math.round(W / 10) }, (_, i) => {
+    const x = (skyRand(i, seed) * W).toFixed(1)
+    const y = (skyRand(i, seed + 1) * Hh).toFixed(1)
+    const r = skyRand(i, seed + 2) < 0.12 ? 0.85 : 0.45
+    const o = (0.3 + skyRand(i, seed + 3) * 0.6).toFixed(2)
+    const tw = i % 5 === 0 ? ` class="tw" style="animation-delay:-${(skyRand(i, 9) * 3).toFixed(2)}s"` : ''
+    return `<circle${tw} cx="${x}" cy="${y}" r="${r}" opacity="${o}"/>`
+  }).join('')
+
+const SKY_CSS = `.bg{fill:#F5F3EE}.edge{fill:none;stroke:#1F1E1D;stroke-opacity:.08}.haze{opacity:.5}.stars{fill:#6F6488;opacity:.45}
+.lb{fill:#8A8780}.vl{fill:#1F1E1D}.sep{fill:#1F1E1D;fill-opacity:.08}.trk{stroke:#1F1E1D;stroke-opacity:.16}
+.st{fill:#8A8780}.go .st{fill:${SKY_CLAY}}.done .st{fill:#2F8F5B}.bb{fill:#FFFFFF;stroke:${SKY_CLAY};stroke-opacity:.55}.bt{fill:#1F1E1D}
+@media (prefers-color-scheme: dark){.bg{fill:#2B2A27}.edge{stroke:#fff}.haze{opacity:1}.stars{fill:#fff;opacity:.85}
+.lb{fill:#A6A39B}.vl{fill:#ECEAE4}.sep{fill:#fff;fill-opacity:.08}.trk{stroke:#fff;stroke-opacity:.2}
+.st{fill:#A6A39B}.go .st{fill:${SKY_GOLD}}.done .st{fill:#7EE0B0}.bb{fill:#1E1B2A}.bt{fill:#ECEAE4}}
+.pop{transform-box:fill-box;animation:pop .22s ease-out 1}@keyframes pop{from{transform:scale(.4);opacity:0}}
+@media (prefers-reduced-motion: reduce){.pop{animation:none}}`
+
+// The motion, written only while an agent runs.
+const skyMotion = (W: number): string => `.tw{animation:tw 2.4s ease-in-out infinite}@keyframes tw{50%{opacity:.1}}
+.shoot{animation:shoot 5s ease-in infinite}@keyframes shoot{0%{transform:translate(-60px,-6px);opacity:0}8%{opacity:1}30%{transform:translate(${Math.round(W * 0.55)}px,26px);opacity:0}100%{transform:translate(${Math.round(W * 0.55)}px,26px);opacity:0}}
+.swirl{animation:swirl 1.6s linear infinite}@keyframes swirl{to{stroke-dashoffset:-19}}
+.wave{animation:wave 1.5s ease-out infinite}@keyframes wave{0%{opacity:0}20%{opacity:1}100%{opacity:0;transform:translate(6px,-4px)}}
+.hammer{animation:hit .55s ease-in-out infinite}@keyframes hit{0%,100%{transform:rotate(-38deg)}55%{transform:rotate(8deg)}}
+.spark{animation:spark .55s steps(1) infinite}@keyframes spark{0%,45%{opacity:0}55%,85%{opacity:1}}
+.glint{animation:glint 1.2s steps(1) infinite}@keyframes glint{50%{opacity:.15}}
+.look{animation:look 3s ease-in-out infinite}@keyframes look{50%{transform:rotate(-12deg)}}
+.rocket{animation:fly 1.8s ease-in infinite}@keyframes fly{0%{transform:translateY(4px);opacity:0}15%{opacity:1}100%{transform:translateY(-14px);opacity:0}}
+.flame{animation:flame .2s steps(1) infinite}@keyframes flame{50%{transform:scaleY(.6)}}
+@media (prefers-reduced-motion: reduce){.tw,.shoot,.swirl,.wave,.hammer,.spark,.glint,.look,.rocket,.flame{animation:none}}`
+
+// Clawd's prop for what the agents are doing, in a 26×H box at x: a satellite beaming
+// signal arcs (mail and messages), a hammer shaping a space rock (writing files), a
+// telescope (searching and reading) or a rocket lifting off (running commands).
+const skyProp = (kind: ActivityKind, x: number, Hh: number): string => {
+  const cy = Hh / 2
+  if (kind === 'signal')
+    return `<g transform="rotate(-20 ${x + 9} ${cy})">
+<rect x="${x + 1}" y="${cy - 2}" width="5" height="4" fill="#8B5CF6"/><rect x="${x + 12}" y="${cy - 2}" width="5" height="4" fill="#8B5CF6"/>
+<path d="M${x + 1} ${cy}h16" stroke="#C4B5FD" stroke-width=".5"/>
+<rect x="${x + 6.5}" y="${cy - 3}" width="5" height="6" rx="1" fill="#C9C2D6"/>
+<path d="M${x + 9} ${cy - 3}v-3" stroke="#C9C2D6"/><circle cx="${x + 9}" cy="${cy - 6.5}" r="1.2" fill="${SKY_CLAY}"/></g>
+${[0, 1, 2].map(i => `<path class="wave" style="animation-delay:${(i * 0.5).toFixed(1)}s" d="M${x + 14 + i * 3} ${cy - 11 - i}a${5 + i * 3} ${5 + i * 3} 0 0 1 ${4 + i * 2} ${5 + i * 2}" fill="none" stroke="${SKY_LILAC}" stroke-width="1.2" stroke-linecap="round"/>`).join('')}`
+  if (kind === 'build')
+    return `<path d="M${x + 3} ${cy + 9}l3-6 6-2 6 3 2 5-4 3h-9z" fill="#6D5A99"/><path d="M${x + 7} ${cy + 4}l3 1M${x + 13} ${cy + 3}l1 3" stroke="#A99BC6" stroke-width=".8"/>
+<g class="hammer" style="transform-origin:${x + 22}px ${cy + 2}px"><path d="M${x + 22} ${cy + 2}l-8-8" stroke="#A88B6A" stroke-width="1.6" stroke-linecap="round"/><rect x="${x + 10.5}" y="${cy - 9.5}" width="6" height="3.4" rx=".6" transform="rotate(-45 ${x + 13.5} ${cy - 7.8})" fill="#C9C2D6"/></g>
+<g class="spark" fill="${SKY_GOLD}"><circle cx="${x + 9}" cy="${cy - 1}" r=".9"/><circle cx="${x + 5}" cy="${cy}" r=".7"/><circle cx="${x + 11}" cy="${cy - 3}" r=".6"/></g>`
+  if (kind === 'scan')
+    return `<g class="look" style="transform-origin:${x + 10}px ${cy + 6}px"><rect x="${x + 3}" y="${cy - 4}" width="16" height="5" rx="1.5" transform="rotate(-28 ${x + 10} ${cy})" fill="#8B5CF6"/>
+<circle class="glint" cx="${x + 18}" cy="${cy - 6}" r="1.6" fill="#E9D5FF"/></g>
+<path d="M${x + 10} ${cy + 1}l-4 9M${x + 10} ${cy + 1}l4 9" stroke="#A99BC6" stroke-width="1.1" stroke-linecap="round"/>
+<path d="M${x + 22} ${cy - 13}l.8 1.6 1.6.8-1.6.8-.8 1.6-.8-1.6-1.6-.8 1.6-.8z" fill="#E9D5FF"/>`
+  return `<g class="rocket"><path d="M${x + 13} ${cy - 10}c3 3 3 9 0 13h-4c-3-4-3-10 0-13 1-1.2 3-1.2 4 0z" transform="translate(-2 0)" fill="#E8E2F2"/>
+<circle cx="${x + 11}" cy="${cy - 4}" r="1.6" fill="#8B5CF6"/><path d="M${x + 7} ${cy + 1}l-2 4h3zM${x + 15} ${cy + 1}l2 4h-3z" fill="${SKY_CLAY}"/>
+<path class="flame" style="transform-origin:${x + 11}px ${cy + 3}px" d="M${x + 9} ${cy + 3}h4l-2 5z" fill="${SKY_GOLD}"/></g>`
+}
+
+const skyBackdrop = (W: number, Hh: number, seed: number, isWorking: boolean): string => `
+<defs>
+<radialGradient id="haze1" cx="${0.45 + skyRand(seed, 1) * 0.4}" cy="0.25" r="0.6"><stop offset="0" stop-color="#A78BFA" stop-opacity=".3"/><stop offset=".5" stop-color="${SKY_LILAC}" stop-opacity=".14"/><stop offset="1" stop-color="${SKY_LILAC}" stop-opacity="0"/></radialGradient>
+<radialGradient id="haze2" cx="0.15" cy="1" r="0.5"><stop offset="0" stop-color="${SKY_CLAY}" stop-opacity=".14"/><stop offset="1" stop-color="${SKY_CLAY}" stop-opacity="0"/></radialGradient>
+<linearGradient id="trail"><stop offset="0" stop-color="${SKY_CLAY}" stop-opacity="0"/><stop offset="1" stop-color="#fff" stop-opacity=".9"/></linearGradient>
+<clipPath id="box"><rect x="0.5" y="0.5" width="${W - 1}" height="${Hh - 1}" rx="10"/></clipPath>
+</defs>
+<rect class="bg" x="0.5" y="0.5" width="${W - 1}" height="${Hh - 1}" rx="10"/>
+<g clip-path="url(#box)">
+<g class="haze"><rect width="${W}" height="${Hh}" fill="url(#haze1)"/><rect width="${W}" height="${Hh}" fill="url(#haze2)"/></g>
+<g class="stars">${skyStars(W, Hh, seed)}</g>
+${isWorking ? `<g class="shoot"><rect width="46" height="1.2" rx=".6" fill="url(#trail)" transform="rotate(14)"/></g>` : ''}
+</g>`
+
+// A black hole: a purple halo, an accretion disk from lilac through violet to clay,
+// a black core with a thin photon ring. The disk's far half passes behind the core
+// and its near half in front. With `pct` the disk is a gauge: only that share of it
+// is lit. While working, streaks swirl around the disk.
+const skyBlackHole = (cx: number, cy: number, isWorking: boolean, pct: number | null = null, isDone = false): string => {
+  const rx = 13
+  const ry = 3.8
+  const per = Math.PI * (3 * (rx + ry) - Math.sqrt((3 * rx + ry) * (rx + 3 * ry)))
+  const tilt = `transform="rotate(-14 ${cx} ${cy})"`
+  const lit = pct === null ? per : per * Math.min(1, Math.max(0, pct))
+  const disk = isDone ? 'url(#diskDone)' : 'url(#disk)'
+  const rings = `<ellipse class="trk" cx="${cx}" cy="${cy}" rx="${rx}" ry="${ry}" fill="none" stroke-width="2.4"/>
+<ellipse cx="${cx}" cy="${cy}" rx="${rx}" ry="${ry}" fill="none" stroke="${disk}" stroke-width="2.4" stroke-linecap="round" stroke-dasharray="${lit.toFixed(1)} ${per.toFixed(1)}" transform="rotate(180 ${cx} ${cy})"/>
+<ellipse${isWorking ? ' class="swirl"' : ''} cx="${cx}" cy="${cy}" rx="${rx}" ry="${ry}" fill="none" stroke="#fff" stroke-opacity=".55" stroke-width=".7" stroke-dasharray="2.5 7"/>`
+  return `<defs>
+<linearGradient id="disk" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#C4B5FD"/><stop offset=".5" stop-color="#8B5CF6"/><stop offset="1" stop-color="#D97757"/></linearGradient>
+<linearGradient id="diskDone" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#A7F3D0"/><stop offset="1" stop-color="#8B5CF6"/></linearGradient>
+<radialGradient id="halo"><stop offset=".35" stop-color="#8B5CF6" stop-opacity=".45"/><stop offset="1" stop-color="#8B5CF6" stop-opacity="0"/></radialGradient>
+<clipPath id="near"><rect x="${cx - 20}" y="${cy}" width="40" height="20"/></clipPath>
+</defs>
+<circle cx="${cx}" cy="${cy}" r="14" fill="url(#halo)"/>
+<g ${tilt}>${rings}</g>
+<circle cx="${cx}" cy="${cy}" r="5.4" fill="#05030A"/>
+<circle cx="${cx}" cy="${cy}" r="5.9" fill="none" stroke="#E9D5FF" stroke-opacity=".9" stroke-width=".7"/>
+<g ${tilt} clip-path="url(#near)">${rings}</g>`
+}
+
+// Far-off things for the empty parts of a panel, one kind per call, at (x, y).
+const SKY_DECOR = ['galaxy', 'ringed', 'moon', 'belt', 'comet', 'nebula', 'planet'] as const
+type SkyDecor = (typeof SKY_DECOR)[number]
+
+const skyDecor = (kind: SkyDecor, x: number, y: number, k: number): string => {
+  if (kind === 'galaxy')
+    return `<defs><radialGradient id="dg${k}"><stop offset="0" stop-color="#fff" stop-opacity=".9"/><stop offset=".3" stop-color="#A78BFA" stop-opacity=".5"/><stop offset="1" stop-color="#8B5CF6" stop-opacity="0"/></radialGradient></defs>
+<g transform="rotate(-24 ${x} ${y})"><ellipse cx="${x}" cy="${y}" rx="20" ry="5.5" fill="url(#dg${k})"/><ellipse cx="${x}" cy="${y}" rx="8" ry="2" fill="none" stroke="#fff" stroke-opacity=".3" stroke-width=".6"/></g>`
+  if (kind === 'ringed')
+    return `<g transform="rotate(-18 ${x} ${y})"><ellipse cx="${x}" cy="${y}" rx="9" ry="2.4" fill="none" stroke="#E8A15E" stroke-opacity=".7" stroke-width="1"/></g>
+<circle cx="${x}" cy="${y}" r="4.2" fill="#B98AE0"/><circle cx="${x + 1.6}" cy="${y - 0.8}" r="3.8" fill="#000" opacity=".25"/>
+<g transform="rotate(-18 ${x} ${y})"><path d="M${x - 9} ${y}A9 2.4 0 0 0 ${x + 9} ${y}" fill="none" stroke="#E8A15E" stroke-opacity=".8" stroke-width="1"/></g>`
+  if (kind === 'moon')
+    return `<circle cx="${x}" cy="${y}" r="5.5" fill="#C9C2D6" opacity=".85"/><circle cx="${x - 1.8}" cy="${y - 1.4}" r="1.2" fill="#8E879C"/><circle cx="${x + 2}" cy="${y + 1.8}" r=".9" fill="#8E879C"/><circle cx="${x + 2.6}" cy="${y}" r="5" fill="#000" opacity=".22"/>`
+  if (kind === 'belt')
+    return Array.from({ length: 9 }, (_, i) => {
+      const ax = x - 26 + i * 6.5 + skyRand(i, 41 + k) * 3
+      const ay = y - 5 + i * 1.3 + skyRand(i, 42 + k) * 4
+      const s = 0.8 + skyRand(i, 43 + k) * 1.4
+      return `<path d="M${ax.toFixed(1)} ${ay.toFixed(1)}l${s} ${-s * 0.6}l${s * 0.9} ${s * 0.5}l${-s * 0.3} ${s}l${-s} ${s * 0.2}z" fill="#A99BC6" opacity="${(0.4 + skyRand(i, 44) * 0.4).toFixed(2)}"/>`
+    }).join('')
+  if (kind === 'comet')
+    return `<defs><linearGradient id="ct${k}" x1="1" y1="0" x2="0" y2="0"><stop offset="0" stop-color="#E9D5FF" stop-opacity=".9"/><stop offset="1" stop-color="#8B5CF6" stop-opacity="0"/></linearGradient></defs>
+<path d="M${x} ${y}l-26 7l26-4.4z" fill="url(#ct${k})"/><circle cx="${x}" cy="${y}" r="1.8" fill="#fff"/>`
+  if (kind === 'nebula')
+    return `<defs><radialGradient id="nb${k}"><stop offset="0" stop-color="#C084FC" stop-opacity=".45"/><stop offset=".6" stop-color="#8B5CF6" stop-opacity=".15"/><stop offset="1" stop-color="#8B5CF6" stop-opacity="0"/></radialGradient></defs>
+<ellipse cx="${x}" cy="${y}" rx="26" ry="11" fill="url(#nb${k})"/><ellipse cx="${x + 9}" cy="${y + 3}" rx="14" ry="7" fill="url(#nb${k})"/>`
+  return `<defs><radialGradient id="pp${k}" cx=".35" cy=".3"><stop offset="0" stop-color="#9FD8FF"/><stop offset="1" stop-color="#4C3A9E"/></radialGradient></defs>
+<circle cx="${x}" cy="${y}" r="5" fill="url(#pp${k})"/><circle cx="${x + 2}" cy="${y - 1}" r="4.6" fill="#000" opacity=".25"/>`
+}
+
+// Two different far-off things for this session's sky, picked by its seed.
+const skyDecorPair = (seed: number): [SkyDecor, SkyDecor] => {
+  const a = Math.floor(skyRand(seed, 5) * SKY_DECOR.length)
+  const b = (a + 1 + Math.floor(skyRand(seed, 6) * (SKY_DECOR.length - 1))) % SKY_DECOR.length
+  return [SKY_DECOR[a] ?? 'galaxy', SKY_DECOR[b] ?? 'moon']
+}
+
+// `speech` is what Clawd says in a bubble beside it, if anything.
+// One-off shows, played a few times and then gone even if the band is not redrawn:
+// three red meteors streaking down across the band when an agent fails, or a rocket
+// lifting off from the black hole when the whole flow is done.
+const skyFlash = (kind: Flash['kind'], W: number, Hh: number): string => {
+  if (kind === 'meteor') {
+    const one = (i: number) => {
+      const x = W * (0.3 + i * 0.22)
+      return `<g class="met" style="animation-delay:${(i * 0.35).toFixed(2)}s"><path d="M${x} -6l-34 ${Hh * 0.55}" stroke="url(#metTrail)" stroke-width="2" stroke-linecap="round"/><circle cx="${x - 34}" cy="${(Hh * 0.55 - 6).toFixed(1)}" r="2.2" fill="#FFD2C2"/></g>`
+    }
+    return `<defs><linearGradient id="metTrail" x1="1" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FF6B5A" stop-opacity="0"/><stop offset="1" stop-color="#FF6B5A"/></linearGradient></defs>
+<style>.met{opacity:0;animation:met 1.1s ease-in 3 both}@keyframes met{0%{opacity:0;transform:translate(0,0)}15%{opacity:1}100%{opacity:0;transform:translate(-26px,${Hh * 0.6}px)}}
+@media (prefers-reduced-motion: reduce){.met{animation:none;opacity:.8}}</style>
+<g clip-path="url(#box)">${[0, 1, 2].map(one).join('')}</g>`
+  }
+  return `<style>.lift{opacity:0;animation:lift 2.2s cubic-bezier(.4,0,.9,.6) 2 both}@keyframes lift{0%{opacity:0;transform:translate(0,0)}10%{opacity:1}100%{opacity:0;transform:translate(${Math.round(W * 0.45)}px,-${Hh + 30}px)}}
+.lf{animation:flame .2s steps(1) 22}@keyframes flame{50%{transform:scaleY(.6)}}
+@media (prefers-reduced-motion: reduce){.lift{animation:none;opacity:1}}</style>
+<g clip-path="url(#box)"><g class="lift"><g transform="translate(40 ${Hh - 6}) rotate(35) scale(1.3)">
+<path d="M0 -12c3 3 3 9 0 13h-4c-3-4-3-10 0-13 1-1.2 3-1.2 4 0z" transform="translate(2 0)" fill="#F4EFE6"/>
+<circle cx="0" cy="-6" r="1.6" fill="#8B5CF6"/><path d="M-4 -1l-2 4h3zM4 -1l2 4h-3z" fill="${SKY_CLAY}"/>
+<path class="lf" style="transform-origin:0 1px" d="M-2 1h4l-2 6z" fill="${SKY_GOLD}"/></g></g></g>`
+}
+
+// Sleepy Clawd: a few z's drifting up from its helmet (still, like the rest of standby).
+const skyZzz = (x: number, y: number): string =>
+  `<g class="lb" font-family="${FONT}" font-style="italic" font-weight="600"><text x="${x}" y="${y}" font-size="7">z</text><text x="${x + 5}" y="${y - 5}" font-size="9">z</text><text x="${x + 11}" y="${y - 11}" font-size="11">Z</text></g>`
+
+// `act` is what the agents are doing right now, if anything: Clawd holds its prop and
+// the status names it. `show` is a one-off show to play; `sleepy` has Clawd doze.
+const bandSvg = (all: Readout[], pct: number | null, state: BandState, W: number, speech = '', seed = 0, act: ActivityKind | null = null, show: Flash['kind'] | null = null, sleepy = false): string => {
   const s = tr()
   const live = state === 'working'
+  const isDone = state === 'complete'
   const crabW = CRAB_BOX * BAND_CRAB
-  const status = state === 'working' ? s.working : state === 'complete' ? s.complete : s.standby
-  const statusW = textWidth(status, 9) + status.length * 1.6 + 18
+  const doing = live ? act : null
+  const PROP_W = doing ? 28 : 0
+  const ACT_WORD: Record<ActivityKind, string> = { signal: s.actSignal, build: s.actBuild, scan: s.actScan, launch: s.actLaunch }
+  const status = doing ? ACT_WORD[doing] : state === 'working' ? s.working : isDone ? s.complete : s.standby
+  const statusW = mono(status, 9) + status.length * 1.5 + 18
   // Readouts that would run under the status or Clawd are left out, from the end.
-  const GAUGE = 48
-  const tail = statusW + crabW + 22
+  const GAUGE = 70
   const cells = [...all]
-  while (cells.length > 1 && GAUGE + cells.reduce((w, r) => w + cellWidth(r), 0) > W - tail) cells.pop()
+  while (cells.length > 1 && GAUGE + cells.reduce((w, r) => w + cellWidth(r), 0) > W - statusW - crabW - PROP_W - 24) cells.pop()
 
   const parts: string[] = []
   let x = GAUGE
-  cells.forEach(r => {
-    const w = cellWidth(r)
-    parts.push(`<rect class="div" x="${rx(x, 1)}" y="9" width="1" height="${H - 18}"/>`)
-    const tx = rtl ? `x="${W - x - CELL_PAD}" text-anchor="end"` : `x="${x + CELL_PAD}"`
-    parts.push(`<text class="lb" ${tx}${rtl ? ' direction="rtl"' : ''} y="17" font-family="${HUD}" font-size="8.5" letter-spacing="1.6">${xml(r.label.toUpperCase())}</text>`)
-    parts.push(`<text class="vl" ${tx} y="33" font-family="${HUD}" font-size="13" font-variant-numeric="tabular-nums">${xml(r.value)}</text>`)
-    x += w
-  })
-  parts.push(`<rect class="div" x="${rx(x, 1)}" y="9" width="1" height="${H - 18}"/>`)
+  for (const r of cells) {
+    parts.push(`<rect class="sep" x="${x}" y="10" width="1" height="${H - 20}"/>`)
+    parts.push(`<text class="lb" x="${x + CELL_PAD}" y="18" font-family="${HUD}" font-size="8" letter-spacing="1.5">${xml(r.label.toUpperCase())}</text>`)
+    parts.push(`<text class="vl" x="${x + CELL_PAD}" y="33" font-family="${HUD}" font-size="12" font-variant-numeric="tabular-nums">${xml(r.value)}</text>`)
+    x += cellWidth(r)
+  }
 
-  // The status word, right of the readouts: a dot that blinks only while working.
-  const sx = W - crabW - 14 - statusW
-  const statusText = `<circle class="dot${live ? ' bl' : ''}" cx="${rx(sx + 4, 0)}" cy="${H / 2}" r="3"/>
-<text class="st" ${rtl ? `x="${W - sx - 12}" text-anchor="end" direction="rtl"` : `x="${sx + 12}"`} y="${H / 2 + 3.2}" font-family="${HUD}" font-size="9" letter-spacing="1.6">${xml(status)}</text>`
+  // Two far-off things in the gap between the readouts and the status, when it is wide.
+  const sx = W - crabW - 16 - PROP_W - statusW
+  const gap = sx - x
+  const decor = skyDecorPair(seed)
+  const far =
+    gap > 150
+      ? `<g clip-path="url(#box)">${skyDecor(decor[0], x + gap * 0.3, H * 0.42, 1)}${gap > 230 ? skyDecor(decor[1], x + gap * 0.72, H * 0.58, 2) : ''}</g>`
+      : ''
 
-  // Clawd stands inside the panel's right end, feet on its floor.
-  const crabX = rx(W - crabW - 6, crabW)
-  const crabY = H - 26 * BAND_CRAB - 6
+  // The status: a comet while working, a dot otherwise.
+  const mark = live
+    ? `<path d="M${sx - 2} ${H / 2 + 3}l-10 4" stroke="${SKY_CLAY}" stroke-opacity=".5" stroke-width="1.4" stroke-linecap="round"/><circle class="st" cx="${sx + 1}" cy="${H / 2 + 1.8}" r="2.6"/>`
+    : `<circle class="st" cx="${sx + 1}" cy="${H / 2}" r="2.6" opacity="${isDone ? 1 : 0.6}"/>`
 
-  // Clawd's callout: amber, opaque, opening toward the readouts over the status.
+  // Clawd's bubble opens toward the readouts, opaque over anything under it.
   let bubble = ''
   if (speech) {
-    const PAD = 7
     const size = 10
-    const room = Math.max(80, W - crabW - 20 - GAUGE)
-    const text = fitText(speech, size, Math.min(room, 320) - PAD * 2)
-    const bw = Math.ceil(textWidth(text, size) + PAD * 2)
-    const bh = 20
-    const by = H / 2 - bh / 2
-    const x0 = rx(W - crabW - 14 - bw, bw)
-    const lx = rtl ? x0 : x0 + bw
-    bubble = `<g class="pop" style="transform-origin:${rtl ? 0 : 100}% 50%">
-<rect class="cb" x="${x0}" y="${by}" width="${bw}" height="${bh}" rx="2"/>
-<path class="cl" d="M${lx} ${H / 2}h${rtl ? -8 : 8}"/>
-<path class="cl" d="M${x0 + (rtl ? bw - 6 : 0)} ${by}h6M${x0 + (rtl ? 0 : bw - 6)} ${by + bh}h6"/>
-<text class="ct" x="${x0 + bw / 2}" y="${H / 2 + 3.5}" text-anchor="middle"${rtl ? ' direction="rtl"' : ''} font-family="${FONT}" font-size="${size}">${xml(text)}</text>
+    const text = fitText(speech, size, Math.min(320, W - crabW - GAUGE - 40))
+    const bw = Math.ceil(textWidth(text, size) + 16)
+    const bx = W - crabW - 14 - bw
+    const by = H / 2 - 10
+    bubble = `<g class="pop" style="transform-origin:100% 50%">
+<path class="bb" d="M${bx + bw - 1} ${H / 2 - 3}l7 3-7 3z"/>
+<rect class="bb" x="${bx}" y="${by}" width="${bw}" height="20" rx="10"/>
+<text class="bt" x="${bx + bw / 2}" y="${H / 2 + 3.5}" text-anchor="middle" font-family="${FONT}" font-size="${size}">${xml(text)}</text>
 </g>`
   }
 
-  const cx = rx(24, 0)
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
-<style>
-.glass{fill:#050f1c;fill-opacity:.94}.rim{fill:none;stroke:url(#rim)}.grid{fill:url(#grid)}
-.ln{stroke:#3fd8ff;stroke-opacity:.18}.div{fill:#3fd8ff;fill-opacity:.18}
-.tick,.ring,.seg,.arc{fill:none;stroke:#3fd8ff}.tick{stroke-width:1;stroke-opacity:.55}.ring{stroke-opacity:.18;stroke-width:2.2}
-.arc{stroke-width:2.2;stroke-linecap:round}.seg{stroke-opacity:.6}
-.pv{fill:#d8f6ff}.lb{fill:#3fd8ff;fill-opacity:.62}.vl{fill:#e6fbff}
-.st,.dot{fill:#3fd8ff}.done .st,.done .dot{fill:#5ef0b0}.done .arc{stroke:#5ef0b0}.idle .dot{fill-opacity:.35}.idle .st{fill-opacity:.6}
-.cb{fill:#140c02;stroke:#ffb547;stroke-opacity:.7}.cl{stroke:#ffb547;fill:none}.ct{fill:#ffd79a}
-.pop{transform-box:fill-box;animation:pop .22s ease-out 1}@keyframes pop{from{transform:scaleX(.2);opacity:0}}
-${
-  live
-    ? `.go .rt1{transform-origin:${cx}px ${H / 2}px;animation:rot 12s linear infinite}.go .rt2{transform-origin:${cx}px ${H / 2}px;animation:rot 4s linear infinite reverse}
-@keyframes rot{to{transform:rotate(360deg)}}
-.go .bl{animation:bl 1.2s steps(1) infinite}@keyframes bl{50%{opacity:.2}}
-.go .sw{animation:sw 3.2s ease-in-out infinite}@keyframes sw{from{transform:translateX(${rtl ? W : -60}px)}to{transform:translateX(${rtl ? -60 : W}px)}}`
-    : ''
-}
-@media (prefers-reduced-motion: reduce){.pop,.go .rt1,.go .rt2,.go .bl,.go .sw{animation:none}}
-</style>
-<defs>
-<linearGradient id="rim" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3fd8ff" stop-opacity=".8"/><stop offset=".5" stop-color="#3fd8ff" stop-opacity=".15"/><stop offset="1" stop-color="#3fd8ff" stop-opacity=".45"/></linearGradient>
-<pattern id="grid" width="8" height="8" patternUnits="userSpaceOnUse"><path d="M8 0H0V8" fill="none" stroke="#3fd8ff" stroke-opacity=".06"/></pattern>
-<linearGradient id="sweep"><stop offset="0" stop-color="#3fd8ff" stop-opacity="0"/><stop offset=".5" stop-color="#3fd8ff" stop-opacity=".16"/><stop offset="1" stop-color="#3fd8ff" stop-opacity="0"/></linearGradient>
-<clipPath id="panel"><rect x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" rx="5"/></clipPath>
-</defs>
-<g class="${live ? 'go' : state === 'complete' ? 'done' : 'idle'}">
-<rect class="glass" x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" rx="5"/>
-<rect class="grid" x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" rx="5"/>
-${live ? `<g clip-path="url(#panel)"><rect class="sw" x="0" y="0" width="60" height="${H}" fill="url(#sweep)"/></g>` : ''}
-<rect class="rim" x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" rx="5"/>
-${reticle(cx, H / 2, pct)}
+<style>${SKY_CSS}${live ? skyMotion(W) : ''}</style>
+${skyBackdrop(W, H, seed, live)}
+${far}
+<g class="${live ? 'go' : isDone ? 'done' : 'idle'}">
+${skyBlackHole(24, H / 2, live, pct ?? 0, isDone)}
+<text class="vl" x="46" y="${H / 2 + 4}" font-family="${HUD}" font-size="11">${pct === null ? '—' : Math.round(pct * 100) + '%'}</text>
 ${parts.join('')}
-${statusText}
+${mark}
+<text class="st" x="${sx + 12}" y="${H / 2 + 3.2}" font-family="${HUD}" font-size="9" letter-spacing="1.5">${xml(status)}</text>
 </g>
-${CRAB_CSS}${crab(crabX, crabY, 'other', false, live, BAND_CRAB, rtl)}
+${doing ? skyProp(doing, W - crabW - 10 - PROP_W, H) : ''}
+${CRAB_CSS}${crab(W - crabW - 8, H / 2 - 14, 'fable', sleepy && !live, live, BAND_CRAB)}
+${sleepy && !live && !speech ? skyZzz(W - crabW - 15, H / 2 - 5) : ''}
+${show ? skyFlash(show, W, H) : ''}
 ${bubble}
+<rect class="edge" x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" rx="10"/>
 </svg>`
 }
-
 
 // ---------------------------------------------------------------------------
 // Agents panel: every subagent of the session, plus the tasks the flow planned.
@@ -944,14 +1140,23 @@ async function speak($: EngineInterface, text: string): Promise<void> {
   await update($, spokeAt, () => at)
 }
 
-// Once a second: take the bubble down when its time is up, and when the band is
-// up with nothing running and Clawd has been quiet for IDLE_MS, say something.
+// Once a second: take the bubble and a one-off show down when their time is up,
+// doze off or wake up with the cache, and when the band is up with nothing running
+// and Clawd has been quiet for IDLE_MS, say something. Writes only on a change.
 async function tickSpeech($: EngineInterface): Promise<void> {
   const at = await $.clock.now()
   const said = await read($, say)
   if (said && at - said.at >= SAY_MS) await update($, say, () => null)
+  const shown = await read($, flash)
+  if (shown && at - shown.at >= FLASH_MS) await update($, flash, () => null)
+
+  const isRunning = (await read($, agents)).some(a => a.status === 'running')
+  const answered = await read($, answeredAt)
+  const sleepy = !isRunning && answered > 0 && at - answered >= CACHE_TTL_MS - SLEEPY_MS
+  if (sleepy !== (await read($, isSleepy))) await update($, isSleepy, () => sleepy)
+
   const f = await read($, flow)
-  if (!f || (await read($, agents)).some(a => a.status === 'running')) return
+  if (!f || isRunning) return
   if (at - (await read($, spokeAt)) < IDLE_MS) return
   const lines = tr().idle
   await speak($, lines[Math.floor(at / IDLE_MS) % lines.length] ?? '')
@@ -1056,7 +1261,12 @@ export const register: Register = (on, options) => {
     }
     const next = await update($, flow, p => merge(p, input))
     if (next && input.tasks?.length) await autoOpen($, next.title)
-    if (next?.isFinished && !prev?.isFinished) await speak($, tr().allDone)
+    if (next?.isFinished && !prev?.isFinished) {
+      // The whole job is done: a rocket lifts off across the band.
+      await speak($, tr().allDone)
+      const at = await $.clock.now()
+      await update($, flash, () => ({ kind: 'liftoff', at }))
+    }
     else if (next && input.tasks?.length) await speak($, `${tr().planReady} · ${next.total} ${tr().tasks.toLowerCase()}`)
     return { result: `ok: ${label(next ?? blank())}` }
   })
@@ -1077,6 +1287,19 @@ export const register: Register = (on, options) => {
       }),
     )
     return { result: matched ? 'ok' : `ignored: no panel row for agent ${agentId}` }
+  })
+
+  // Notes what kind of work a tool call is, for Clawd to act out; the call itself
+  // passes through untouched, and a failure to note it never blocks it.
+  on('tool.call', async ($, e, next) => {
+    const kind = activityOf(String(e.tool))
+    if (kind) {
+      await $.clock
+        .now()
+        .then(at => update($, activity, () => ({ kind, at })))
+        .catch(() => undefined)
+    }
+    return next(e)
   })
 
   // Safety net: worker launches move the faint layer even if the orchestrator forgets to report.
@@ -1202,7 +1425,14 @@ export const register: Register = (on, options) => {
         const s = tr()
         const what = clip(run.description || run.type, 32)
         await speak($, run.status === 'done' ? `${s.taskDone}: ${what}` : `${s.taskFailed}: ${what}`)
+        // A failed agent rains meteors across the band.
+        if (run.status === 'failed') await update($, flash, () => ({ kind: 'meteor', at }))
       }
+    } else {
+      // The main session answered: the prompt cache starts its hour again, and Clawd wakes.
+      const at = await $.clock.now()
+      await update($, answeredAt, () => at)
+      if (await read($, isSleepy)) await update($, isSleepy, () => false)
     }
     return next(e)
   })
@@ -1403,8 +1633,15 @@ export const register: Register = (on, options) => {
     const pct = f && (f.total || f.isFinished) ? ratio(f) : null
     const s = tr()
     const status = state === 'working' ? s.working : state === 'complete' ? s.complete : s.standby
+    const clock = await $.clock.now()
     const said = await read($, say)
-    const speech = said && (await $.clock.now()) - said.at < SAY_MS ? said.text : ''
+    const speech = said && clock - said.at < SAY_MS ? said.text : ''
+    // What the agents are doing, while it is fresh and something runs.
+    const act = await read($, activity)
+    const doing = isWorking && act && clock - act.at < ACTIVITY_MS ? act.kind : null
+    const shown = await read($, flash)
+    const show = shown && clock - shown.at < FLASH_MS ? shown.kind : null
+    const sleepy = await read($, isSleepy)
     const crewButton = (
       <Button key="savvy-agents" label={`×${crew}`} plain onPress={() => void togglePane($)} />
     )
@@ -1429,7 +1666,7 @@ export const register: Register = (on, options) => {
         <Box flexDirection="column">
           <Box flexDirection={isRtl() ? 'row-reverse' : 'row'} alignItems="center" gap={1}>
             <Svg
-              source={bandSvg(cells, pct, state, width, speech)}
+              source={bandSvg(cells, pct, state, width, speech, skySeed(await $.session.id()) + 3, doing, show, sleepy)}
               alt={`${status}. ${summary}${speech ? `. Clawd: ${speech}` : ''}`}
               width={width}
               height={H}
