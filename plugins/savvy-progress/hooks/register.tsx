@@ -35,7 +35,8 @@ const TIERS: readonly string[] = ['fable', 'heavy', 'careful', 'medium', 'light'
 const MAX_TASKS = 200
 const MAX_AFTER = 20
 const MAX_TITLE = 120
-const ACCENT = '#8f8cf4'
+// The HUD's data color, and the color of a finished flow.
+const CYAN = '#3fd8ff'
 const DONE = '#5fbf8f'
 
 type ProgressInput = {
@@ -85,6 +86,11 @@ const STRINGS = {
     tier: { light: 'light', medium: 'medium', careful: 'careful', heavy: 'heavy', fable: 'fable', other: 'other' },
     effort: { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
     planReady: 'Plan ready',
+    active: 'active',
+    idleWord: 'idle',
+    working: 'WORKING',
+    standby: 'STANDBY',
+    complete: 'COMPLETE',
     taskDone: 'Done',
     taskFailed: 'Hit a snag',
     allDone: 'All done! Nice work',
@@ -130,6 +136,11 @@ const STRINGS = {
     tier: { light: 'light', medium: 'medium', careful: 'careful', heavy: 'heavy', fable: 'fable', other: 'other' },
     effort: { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
     planReady: 'План готов',
+    active: 'активны',
+    idleWord: 'простой',
+    working: 'РАБОТАЕТ',
+    standby: 'ОЖИДАНИЕ',
+    complete: 'ГОТОВО',
     taskDone: 'Готово',
     taskFailed: 'Что-то пошло не так',
     allDone: 'Всё готово! Отличная работа',
@@ -175,6 +186,11 @@ const STRINGS = {
     tier: { light: 'קל', medium: 'בינוני', careful: 'זהיר', heavy: 'כבד', fable: 'פייבל', other: 'אחר' },
     effort: { low: 'נמוך', medium: 'בינוני', high: 'גבוה', xhigh: 'גבוה מאוד', max: 'מקסימלי' },
     planReady: 'התוכנית מוכנה',
+    active: 'פעילים',
+    idleWord: 'במנוחה',
+    working: 'פועל',
+    standby: 'בהמתנה',
+    complete: 'הושלם',
     taskDone: 'הושלם',
     taskFailed: 'משהו השתבש',
     allDone: 'הכול מוכן! עבודה יפה',
@@ -277,23 +293,16 @@ const label = (f: Flow): string => {
 const ratio = (f: Flow): number => (f.isFinished ? 1 : f.total ? f.done / f.total : 0)
 
 // The whole row is one SVG: the desktop wraps sibling elements onto new lines,
-// so title, bar, percent and the crab live in one drawing; only the count and
-// the dismiss are Buttons beside it.
-// HUD look: a thin glowing bar between corner brackets over a ruler, a reticle
-// before the title, and Clawd standing at the fill's head. Nothing moves unless
-// a worker is running: then the crab walks, the reticle turns, a scan line
-// sweeps the fill and the blocks handed to workers march.
-const H = 38
-const BAR_H = 8
-// The bar's top edge: the crab's feet stand on it.
-const BAR_Y = 24
+// so the gauge, readouts, status, crab and its callout live in one drawing; only
+// the count and the dismiss are Buttons beside it. Nothing moves unless an agent
+// is running.
+const H = 44
 // The crab's drawing grid is 30 units wide, props included.
 const CRAB_BOX = 30
-const BAND_CRAB = 0.7
+const BAND_CRAB = 0.62
 const FONT = "-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-serif"
 const HUD = "'Cascadia Mono','SF Mono',Consolas,ui-monospace,monospace"
-// Up to this many tasks, each task is one block of the bar.
-const MAX_BLOCKS = 24
+
 const xml = (s: string): string =>
   s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c] ?? c)
 
@@ -321,151 +330,148 @@ const fitText = (s: string, size: number, maxW: number): string => {
   return out + '…'
 }
 
-// `speech` is what Clawd says in a bubble beside it, if anything.
-const rowSvg = (f: Flow, W: number, isWorking: boolean, speech = ''): string => {
-  // Positions are worked out left to right; right to left mirrors each box
-  // inside the bar (`bx`) and across the row (`rx`). Text is never mirrored.
+// JARVIS-style panel: cyan data on a dark glass field lit from its rim, a
+// reticle gauge of layered rings, and labeled readouts. The panel is dark in
+// both themes, as a HUD is. Amber marks Clawd's callouts.
+type Readout = { label: string; value: string }
+type BandState = 'working' | 'standby' | 'complete'
+
+// What the band reads out, each with its name: tasks, agents, tokens, cost.
+const bandReadouts = (f: Flow | null, list: AgentRun[], at: number): Readout[] => {
+  const s = tr()
+  const t = totals(list, at)
+  const active = list.filter(a => a.status === 'running').length
+  const out: Readout[] = []
+  if (f) out.push({ label: s.tasks, value: f.isFinished ? s.done : f.total ? `${f.done} / ${f.total}` : label(f) })
+  out.push({ label: s.pane, value: active ? `${active} ${s.active}` : s.idleWord })
+  if (list.length) {
+    out.push({ label: s.tokens, value: fmtTokens(t.tokens) })
+    out.push({ label: s.cost, value: fmtCost(t.cost) })
+  }
+  return out
+}
+
+const CELL_PAD = 14
+const cellWidth = (r: Readout): number => Math.max(textWidth(r.label.toUpperCase(), 8.5) + r.label.length * 1.6, textWidth(r.value, 13) * 1.05) + CELL_PAD * 2
+
+// The reticle: a ticked outer ring, a segmented middle ring, the progress arc
+// and the percent at its heart. While working the rings turn against each other.
+const reticle = (cx: number, cy: number, pct: number | null): string => {
+  const ticks = Array.from({ length: 36 }, (_, i) => {
+    const a = (i * Math.PI) / 18
+    const r0 = i % 3 ? 15.5 : 14
+    return `M${(cx + Math.cos(a) * r0).toFixed(2)} ${(cy + Math.sin(a) * r0).toFixed(2)}L${(cx + Math.cos(a) * 17).toFixed(2)} ${(cy + Math.sin(a) * 17).toFixed(2)}`
+  }).join('')
+  const R = 11
+  const C = 2 * Math.PI * R
+  const arc =
+    pct === null
+      ? ''
+      : `<circle class="arc" cx="${cx}" cy="${cy}" r="${R}" stroke-dasharray="${(C * pct).toFixed(2)} ${C.toFixed(2)}" transform="rotate(-90 ${cx} ${cy})"/>`
+  return `<g class="rt1"><path class="tick" d="${ticks}"/></g>
+<circle class="ring" cx="${cx}" cy="${cy}" r="${R}"/>${arc}
+<g class="rt2"><circle class="seg" cx="${cx}" cy="${cy}" r="7.5" stroke-dasharray="9.8 2"/></g>
+<text class="pv" x="${cx}" y="${cy + 3}" text-anchor="middle" font-family="${HUD}" font-size="8.5">${pct === null ? '—' : Math.round(pct * 100)}</text>`
+}
+
+// `speech` is what Clawd says in a callout beside it, if anything.
+const bandSvg = (all: Readout[], pct: number | null, state: BandState, W: number, speech = ''): string => {
+  // Positions are worked out left to right; right to left mirrors each box (`rx`).
   const rtl = isRtl()
   const rx = (x: number, w: number): number => (rtl ? W - x - w : x)
-  // Motion only while something is going on.
-  const live = isWorking && !f.isFinished
-
-  const title = fitText(f.title.toUpperCase(), 10, Math.max(60, W * 0.3))
-  // Letter-spaced HUD type: 1.5px after every character.
-  const spaced = (s: string, size: number): number => textWidth(s, size) + [...s].length * 1.5
-  const hud = label(f).toUpperCase()
-  const percent = `${Math.round(ratio(f) * 100)}`
-  const slotW = Math.round(Math.max(52, spaced(hud, 9) + 8))
-  const BAR_X = Math.round(20 + spaced(title, 10) + 14)
-  const BAR_W = Math.max(80, W - BAR_X - slotW - 12)
-  const bx = (x: number, w: number): number => (rtl ? BAR_W - x - w : x)
-
-  // Blocks: one per task when there are few, else even 6px chunks.
-  const inner = BAR_W - 6
-  const gap = 2
-  const perTask = f.total > 0 && f.total <= MAX_BLOCKS
-  const segs = perTask ? f.total : Math.max(4, Math.floor(inner / 6))
-  const segW = (inner - gap * (segs - 1)) / segs
-  const filled = Math.round(segs * ratio(f))
-  // Handed to workers, not yet accepted: outlined blocks.
-  const runTo = f.total ? Math.max(filled, Math.round((segs * Math.min(f.total, f.done + f.running)) / f.total)) : filled
-  const on: string[] = []
-  const rest: string[] = []
-  for (let i = 0; i < segs; i++) {
-    const x = bx(3 + i * (segW + gap), segW)
-    const w = segW.toFixed(2)
-    if (i < filled) on.push(`<rect class="on" x="${x.toFixed(2)}" y="2" width="${w}" height="${BAR_H - 4}"/>`)
-    else if (i < runTo) rest.push(`<rect class="rn${live ? ' mv' : ''}" x="${(x + 0.5).toFixed(2)}" y="2.5" width="${(segW - 1).toFixed(2)}" height="${BAR_H - 5}"/>`)
-    else rest.push(`<rect class="off" x="${x.toFixed(2)}" y="${BAR_H / 2 - 0.5}" width="${w}" height="1"/>`)
-  }
-  const fillW = filled ? filled * (segW + gap) - gap : 0
-  const headX = 3 + fillW
-
-  // Corner brackets in place of a box, and a ruler underneath: a tick every 10%.
-  const bracket = (x: number, y: number, dx: number, dy: number): string => `<path class="ln" d="M${x + dx * 6} ${y}H${x}V${y + dy * 3}"/>`
-  const frame = [bracket(0.5, 0.5, 1, 1), bracket(BAR_W - 0.5, 0.5, -1, 1), bracket(0.5, BAR_H - 0.5, 1, -1), bracket(BAR_W - 0.5, BAR_H - 0.5, -1, -1)].join('')
-  const ruler = Array.from({ length: 11 }, (_, k) => `<rect class="tk" x="${bx((k * (BAR_W - 1)) / 10, 1).toFixed(2)}" y="${BAR_H + 2}" width="1" height="${k % 5 ? 1.5 : 3}"/>`).join('')
-  // The head: a hairline through the bar at the fill's edge.
-  const head = filled && !f.isFinished ? `<rect class="ac${live ? ' hd' : ''}" x="${bx(headX, 1).toFixed(2)}" y="-2" width="1" height="${BAR_H + 4}"/>` : ''
-  // A light sweeping the fill, left to right (right to left in Hebrew).
-  const SCAN = 28
-  const scan =
-    live && fillW > 12
-      ? `<clipPath id="fc"><rect x="${bx(3, fillW).toFixed(2)}" y="0" width="${fillW.toFixed(2)}" height="${BAR_H}"/></clipPath>
-<g clip-path="url(#fc)"><rect class="sc" x="0" y="2" width="${SCAN}" height="${BAR_H - 4}" fill="url(#sg)"/></g>`
-      : ''
-  const scanFrom = rtl ? BAR_W - 3 : 3 - SCAN
-  const scanTo = rtl ? BAR_W - 3 - fillW - SCAN : 3 + fillW
-
-  // Clawd stands on the bar at the fill's head; at the end once finished.
+  const s = tr()
+  const live = state === 'working'
   const crabW = CRAB_BOX * BAND_CRAB
-  const crabX = Math.max(0, Math.min(BAR_W - crabW, headX - crabW / 2))
-  // Legs end on grid row 26: lift the crab so its feet touch the bar's top.
-  const crabY = BAR_Y - 26 * BAND_CRAB - 1
-  const crabRowX = BAR_X + bx(crabX, crabW)
+  const status = state === 'working' ? s.working : state === 'complete' ? s.complete : s.standby
+  const statusW = textWidth(status, 9) + status.length * 1.6 + 18
+  // Readouts that would run under the status or Clawd are left out, from the end.
+  const GAUGE = 48
+  const tail = statusW + crabW + 22
+  const cells = [...all]
+  while (cells.length > 1 && GAUGE + cells.reduce((w, r) => w + cellWidth(r), 0) > W - tail) cells.pop()
 
-  // The speech bubble sits beside Clawd's head, on the side it faces when there
-  // is room (right; left in Hebrew), else the other side; never over the readout.
+  const parts: string[] = []
+  let x = GAUGE
+  cells.forEach(r => {
+    const w = cellWidth(r)
+    parts.push(`<rect class="div" x="${rx(x, 1)}" y="9" width="1" height="${H - 18}"/>`)
+    const tx = rtl ? `x="${W - x - CELL_PAD}" text-anchor="end"` : `x="${x + CELL_PAD}"`
+    parts.push(`<text class="lb" ${tx}${rtl ? ' direction="rtl"' : ''} y="17" font-family="${HUD}" font-size="8.5" letter-spacing="1.6">${xml(r.label.toUpperCase())}</text>`)
+    parts.push(`<text class="vl" ${tx} y="33" font-family="${HUD}" font-size="13" font-variant-numeric="tabular-nums">${xml(r.value)}</text>`)
+    x += w
+  })
+  parts.push(`<rect class="div" x="${rx(x, 1)}" y="9" width="1" height="${H - 18}"/>`)
+
+  // The status word, right of the readouts: a dot that blinks only while working.
+  const sx = W - crabW - 14 - statusW
+  const statusText = `<circle class="dot${live ? ' bl' : ''}" cx="${rx(sx + 4, 0)}" cy="${H / 2}" r="3"/>
+<text class="st" ${rtl ? `x="${W - sx - 12}" text-anchor="end" direction="rtl"` : `x="${sx + 12}"`} y="${H / 2 + 3.2}" font-family="${HUD}" font-size="9" letter-spacing="1.6">${xml(status)}</text>`
+
+  // Clawd stands inside the panel's right end, feet on its floor.
+  const crabX = rx(W - crabW - 6, crabW)
+  const crabY = H - 26 * BAND_CRAB - 6
+
+  // Clawd's callout: amber, opaque, opening toward the readouts over the status.
   let bubble = ''
   if (speech) {
-    const PAD = 6
-    const size = 9.5
-    const room = { right: W - slotW - 8 - (crabRowX + crabW + 4), left: crabRowX - 4 }
-    const want = rtl ? 'left' : 'right'
-    const side = room[want] >= Math.min(textWidth(speech, size) + PAD * 2, 140) || room[want] >= room[want === 'left' ? 'right' : 'left'] ? want : want === 'left' ? 'right' : 'left'
-    const text = fitText(speech, size, Math.max(0, room[side] - PAD * 2))
-    if (room[side] > 40) {
-      const bw = Math.ceil(textWidth(text, size) + PAD * 2)
-      const by = 1
-      const bh = 15
-      const x0 = side === 'right' ? crabRowX + crabW + 4 : crabRowX - 4 - bw
-      // The tail points down at Clawd's head.
-      const tx = side === 'right' ? x0 : x0 + bw
-      const dir = side === 'right' ? -1 : 1
-      bubble = `<g class="pop" style="transform-origin:${side === 'right' ? 0 : 100}% 100%">
-<path class="bb" d="M${tx} ${by + bh - 6}l${dir * 5} 6l${-dir * 0.5}-8z"/>
-<rect class="bb" x="${x0}" y="${by}" width="${bw}" height="${bh}" rx="5"/>
-<text class="t" x="${x0 + bw / 2}" y="${by + bh / 2 + 3.3}" text-anchor="middle"${rtl ? ' direction="rtl"' : ''} font-family="${HUD}" font-size="${size}">${xml(text)}</text>
+    const PAD = 7
+    const size = 10
+    const room = Math.max(80, W - crabW - 20 - GAUGE)
+    const text = fitText(speech, size, Math.min(room, 320) - PAD * 2)
+    const bw = Math.ceil(textWidth(text, size) + PAD * 2)
+    const bh = 20
+    const by = H / 2 - bh / 2
+    const x0 = rx(W - crabW - 14 - bw, bw)
+    const lx = rtl ? x0 : x0 + bw
+    bubble = `<g class="pop" style="transform-origin:${rtl ? 0 : 100}% 50%">
+<rect class="cb" x="${x0}" y="${by}" width="${bw}" height="${bh}" rx="2"/>
+<path class="cl" d="M${lx} ${H / 2}h${rtl ? -8 : 8}"/>
+<path class="cl" d="M${x0 + (rtl ? bw - 6 : 0)} ${by}h6M${x0 + (rtl ? 0 : bw - 6)} ${by + bh}h6"/>
+<text class="ct" x="${x0 + bw / 2}" y="${H / 2 + 3.5}" text-anchor="middle"${rtl ? ' direction="rtl"' : ''} font-family="${FONT}" font-size="${size}">${xml(text)}</text>
 </g>`
-    }
   }
 
-  const midY = BAR_Y + BAR_H / 2
-  const cx = rtl ? W - 6 : 6
-  // `direction="rtl"` puts Hebrew words and numbers in reading order; `start` is then the right edge.
-  const titleAt = rtl ? `x="${W - 20}" direction="rtl" text-anchor="start"` : 'x="20"'
-  const slotAt = rtl ? 'x="0"' : `x="${W}" text-anchor="end"`
-
+  const cx = rx(24, 0)
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
 <style>
-.hud,.bb{--c:#1E6FD9;--k:#cfd3dc}.g0{stop-color:#1E88E5}.g1{stop-color:#7C4DFF}
-.ok{--c:#10B981}.ok .g0{stop-color:#10B981}.ok .g1{stop-color:#06B6D4}
-.t{fill:#1f1f1f}.s{fill:#8a8a86}.bb{fill:#fff;stroke:var(--c);stroke-opacity:.55}
-@media (prefers-color-scheme: dark){.hud,.bb{--c:#5CC8FF;--k:#2f3446}.g0{stop-color:#4FC3F7}.g1{stop-color:#A78BFA}
-.ok{--c:#34D399}.ok .g0{stop-color:#34D399}.ok .g1{stop-color:#22D3EE}
-.t{fill:#ececec}.s{fill:#8f8f8a}.bb{fill:#101829}}
-.on{fill:url(#bg)}.ac{fill:var(--c)}.rn{fill:none;stroke:var(--c);stroke-opacity:.6}.off,.tk{fill:var(--k)}.ln,.rt,.ri{fill:none;stroke:var(--c);stroke-opacity:.6}.ri{stroke-opacity:.9}
-.pop{transform-box:fill-box;animation:pop .25s ease-out 1}@keyframes pop{from{transform:scale(.5);opacity:0}}
-@media (prefers-reduced-motion: reduce){.pop{animation:none}}
+.glass{fill:#050f1c;fill-opacity:.94}.rim{fill:none;stroke:url(#rim)}.grid{fill:url(#grid)}
+.ln{stroke:#3fd8ff;stroke-opacity:.18}.div{fill:#3fd8ff;fill-opacity:.18}
+.tick,.ring,.seg,.arc{fill:none;stroke:#3fd8ff}.tick{stroke-width:1;stroke-opacity:.55}.ring{stroke-opacity:.18;stroke-width:2.2}
+.arc{stroke-width:2.2;stroke-linecap:round}.seg{stroke-opacity:.6}
+.pv{fill:#d8f6ff}.lb{fill:#3fd8ff;fill-opacity:.62}.vl{fill:#e6fbff}
+.st,.dot{fill:#3fd8ff}.done .st,.done .dot{fill:#5ef0b0}.done .arc{stroke:#5ef0b0}.idle .dot{fill-opacity:.35}.idle .st{fill-opacity:.6}
+.cb{fill:#140c02;stroke:#ffb547;stroke-opacity:.7}.cl{stroke:#ffb547;fill:none}.ct{fill:#ffd79a}
+.pop{transform-box:fill-box;animation:pop .22s ease-out 1}@keyframes pop{from{transform:scaleX(.2);opacity:0}}
 ${
   live
-    ? `.go .mv{stroke-dasharray:3 2;animation:da 1s linear infinite}@keyframes da{to{stroke-dashoffset:-5}}
-.go .rt{transform-box:fill-box;transform-origin:50% 50%;animation:rot 6s linear infinite}@keyframes rot{to{transform:rotate(360deg)}}
-.go .ri{transform-box:fill-box;transform-origin:50% 50%;animation:rot 3s linear infinite reverse}
-.go .sc{animation:sw 2.4s linear infinite}@keyframes sw{from{transform:translateX(${scanFrom}px)}to{transform:translateX(${scanTo}px)}}
-.go .hd{animation:hp 1.2s ease-in-out infinite}@keyframes hp{50%{opacity:.35}}
-@media (prefers-reduced-motion: reduce){.go .mv,.go .rt,.go .ri,.go .sc,.go .hd{animation:none}}`
+    ? `.go .rt1{transform-origin:${cx}px ${H / 2}px;animation:rot 12s linear infinite}.go .rt2{transform-origin:${cx}px ${H / 2}px;animation:rot 4s linear infinite reverse}
+@keyframes rot{to{transform:rotate(360deg)}}
+.go .bl{animation:bl 1.2s steps(1) infinite}@keyframes bl{50%{opacity:.2}}
+.go .sw{animation:sw 3.2s ease-in-out infinite}@keyframes sw{from{transform:translateX(${rtl ? W : -60}px)}to{transform:translateX(${rtl ? -60 : W}px)}}`
     : ''
 }
+@media (prefers-reduced-motion: reduce){.pop,.go .rt1,.go .rt2,.go .bl,.go .sw{animation:none}}
 </style>
 <defs>
-<filter id="gl" x="-10%" y="-150%" width="120%" height="400%"><feGaussianBlur stdDeviation="1.6" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
-<linearGradient id="bg"${f.isFinished ? ' class="ok"' : ''} gradientUnits="userSpaceOnUse" x1="${rtl ? BAR_W : 0}" y1="0" x2="${rtl ? 0 : BAR_W}" y2="0"><stop class="g0" offset="0"/><stop class="g1" offset="1"/></linearGradient>
-<linearGradient id="sg"><stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset=".5" stop-color="#fff" stop-opacity=".75"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+<linearGradient id="rim" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3fd8ff" stop-opacity=".8"/><stop offset=".5" stop-color="#3fd8ff" stop-opacity=".15"/><stop offset="1" stop-color="#3fd8ff" stop-opacity=".45"/></linearGradient>
+<pattern id="grid" width="8" height="8" patternUnits="userSpaceOnUse"><path d="M8 0H0V8" fill="none" stroke="#3fd8ff" stroke-opacity=".06"/></pattern>
+<linearGradient id="sweep"><stop offset="0" stop-color="#3fd8ff" stop-opacity="0"/><stop offset=".5" stop-color="#3fd8ff" stop-opacity=".16"/><stop offset="1" stop-color="#3fd8ff" stop-opacity="0"/></linearGradient>
+<clipPath id="panel"><rect x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" rx="5"/></clipPath>
 </defs>
-<g class="hud${f.isFinished ? ' ok' : ''}${live ? ' go' : ''}">
-<circle class="rt" cx="${cx}" cy="${midY}" r="6" stroke-dasharray="7 2.42"/>
-<circle class="ri" cx="${cx}" cy="${midY}" r="3.6" stroke-dasharray="11 11.6"/>
-<circle class="ac" cx="${cx}" cy="${midY}" r="1.3"/>
-<text class="t" ${titleAt} y="${midY + 3.5}" font-family="${HUD}" font-size="10" letter-spacing="1.5">${xml(title)}</text>
-<g transform="translate(${rx(BAR_X, BAR_W)},${BAR_Y})">
-${frame}${ruler}${rest.join('')}
-<g filter="url(#gl)">${on.join('')}${head}</g>
-${scan}
+<g class="${live ? 'go' : state === 'complete' ? 'done' : 'idle'}">
+<rect class="glass" x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" rx="5"/>
+<rect class="grid" x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" rx="5"/>
+${live ? `<g clip-path="url(#panel)"><rect class="sw" x="0" y="0" width="60" height="${H}" fill="url(#sweep)"/></g>` : ''}
+<rect class="rim" x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" rx="5"/>
+${reticle(cx, H / 2, pct)}
+${parts.join('')}
+${statusText}
 </g>
-<text class="s" ${slotAt} y="${BAR_Y - 6}" font-family="${HUD}" font-size="9" letter-spacing="1.5"${rtl ? ' direction="rtl" text-anchor="end"' : ''}>${xml(hud)}</text>
-<text class="t" ${slotAt} y="${BAR_Y + BAR_H + 4}" font-family="${HUD}" font-size="14" font-weight="300" font-variant-numeric="tabular-nums">${percent}<tspan class="s" font-size="9">%</tspan></text>
-</g>
-${CRAB_CSS}${crab(crabRowX, crabY, 'other', false, live, BAND_CRAB, rtl)}
+${CRAB_CSS}${crab(crabX, crabY, 'other', false, live, BAND_CRAB, rtl)}
 ${bubble}
 </svg>`
 }
 
-// Terminal: a thin HUD line.
-const barText = (f: Flow, width: number): string => {
-  const filled = Math.round(width * ratio(f))
-  return '━'.repeat(filled) + '─'.repeat(Math.max(0, width - filled))
-}
 
 // ---------------------------------------------------------------------------
 // Agents panel: every subagent of the session, plus the tasks the flow planned.
@@ -1378,7 +1384,10 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const f = await read($, flow)
-    if (f === null || e.props.hasSurvey) return next(e)
+    const list = await read($, agents)
+    const isWorking = list.some(a => a.status === 'running')
+    // Up while a flow is reported or any agent runs.
+    if ((f === null && !isWorking) || e.props.hasSurvey) return next(e)
     // Draw this row with the other mods' bands beneath it. Claude Code's own placeholder ({ type: 'engine' }) is
     // never nested: the desktop drops a band that nests it.
     const drawn = await Promise.resolve(next(e)).catch(() => null)
@@ -1386,15 +1395,20 @@ export const register: Register = (on, options) => {
 
     const ui = $.ui.resolve(e)
     const { Box, Text, Button } = ui
-    const list = await read($, agents)
     const crew = list.length + plannedOf(f, list).length
-    const isWorking = list.some(a => a.status === 'running')
+    // Reading `now` redraws the time once a second, only while an agent runs.
+    const at = Math.max(await read($, now), ...list.map(a => a.startedAt), 0)
+    const cells = bandReadouts(f, list, at)
+    const state: BandState = f?.isFinished ? 'complete' : isWorking ? 'working' : 'standby'
+    const pct = f && (f.total || f.isFinished) ? ratio(f) : null
+    const s = tr()
+    const status = state === 'working' ? s.working : state === 'complete' ? s.complete : s.standby
     const said = await read($, say)
     const speech = said && (await $.clock.now()) - said.at < SAY_MS ? said.text : ''
     const crewButton = (
       <Button key="savvy-agents" label={`×${crew}`} plain onPress={() => void togglePane($)} />
     )
-    const percent = `${Math.round(ratio(f) * 100)}%`
+    const summary = cells.map(c => `${c.label} ${c.value}`).join(', ')
     const dismiss = (
       <Button
         key="savvy-dismiss"
@@ -1414,7 +1428,12 @@ export const register: Register = (on, options) => {
       return (
         <Box flexDirection="column">
           <Box flexDirection={isRtl() ? 'row-reverse' : 'row'} alignItems="center" gap={1}>
-            <Svg source={rowSvg(f, width, isWorking, speech)} alt={`${f.title}: ${label(f)}, ${percent}${speech ? `. Clawd: ${speech}` : ''}`} width={width} height={H} />
+            <Svg
+              source={bandSvg(cells, pct, state, width, speech)}
+              alt={`${status}. ${summary}${speech ? `. Clawd: ${speech}` : ''}`}
+              width={width}
+              height={H}
+            />
             {crewButton}
             {dismiss}
           </Box>
@@ -1423,19 +1442,25 @@ export const register: Register = (on, options) => {
       )
     }
 
-    const cols = e.props.bodyColumns
-    const titleW = Math.max(8, Math.min(30, f.title.length + 2, Math.floor(cols / 3)))
-    const width = Math.max(6, Math.min(40, cols - titleW - 32))
+    // Terminal: the same readouts as LABEL value, the percent and the status word.
+    const color = state === 'complete' ? DONE : CYAN
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" gap={2}>
-          <Box width={titleW} flexShrink={0}>
-            <Text color={f.isFinished ? DONE : ACCENT}>● </Text>
-            <Text wrap="truncate-end">{f.title}</Text>
-          </Box>
-          <Text color={f.isFinished ? DONE : ACCENT}>{barText(f, width)}</Text>
-          <Text bold>{label(f)}</Text>
-          <Text dimColor>{percent}</Text>
+          <Text color={color} bold>
+            ◎ {pct === null ? '—' : `${Math.round(pct * 100)}%`}
+          </Text>
+          {cells.map(c => (
+            <Text key={c.label} wrap="truncate-end">
+              <Text color={color} dimColor>
+                {c.label.toUpperCase()}{' '}
+              </Text>
+              <Text bold>{c.value}</Text>
+            </Text>
+          ))}
+          <Text color={color} dimColor={state === 'standby'}>
+            ● {status}
+          </Text>
           <Text color={CLAY}>▣</Text>
           {crewButton}
           {dismiss}
