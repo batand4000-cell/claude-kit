@@ -46,6 +46,12 @@ export type Panel = {
   autoOpenedFor: string
 }
 
+/** What Clawd is saying in the band's speech bubble, and since when. */
+export type Speech = {
+  text: string
+  at: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'savvy-progress': {
@@ -53,6 +59,9 @@ declare module 'claude-code' {
       agents: AgentRun[]
       panel: Panel
       now: number
+      say: Speech | null
+      /** When Clawd last spoke; idle chatter waits IDLE_MS after it. */
+      spokeAt: number
     }
   }
 }
