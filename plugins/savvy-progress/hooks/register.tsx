@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRun, Flow, Panel, Phase, PlannedTask } from '../types'
+import type { AgentRun, Flow, Panel, Phase, PlannedTask, Speech } from '../types'
 
 const flow = atom({ plugin: 'savvy-progress', key: 'flow' } as const, null)
 const agents = atom({ plugin: 'savvy-progress', key: 'agents' } as const, [])
@@ -11,6 +11,13 @@ const panel = atom({ plugin: 'savvy-progress', key: 'panel' } as const, {
   autoOpenedFor: '',
 })
 const now = atom({ plugin: 'savvy-progress', key: 'now' } as const, 0)
+const say = atom({ plugin: 'savvy-progress', key: 'say' } as const, null as Speech | null)
+const spokeAt = atom({ plugin: 'savvy-progress', key: 'spokeAt' } as const, 0)
+
+// Clawd's speech bubble: how long a line stays up, and how long a quiet band
+// waits before Clawd says something on its own.
+const SAY_MS = 8_000
+const IDLE_MS = 5 * 60_000
 
 const TOOL = 'mcp__savvy-progress__progress'
 const STEP_TOOL = 'mcp__savvy-progress__step'
@@ -77,6 +84,20 @@ const STRINGS = {
     ctx: 'ctx',
     tier: { light: 'light', medium: 'medium', careful: 'careful', heavy: 'heavy', fable: 'fable', other: 'other' },
     effort: { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
+    planReady: 'Plan ready',
+    taskDone: 'Done',
+    taskFailed: 'Hit a snag',
+    allDone: 'All done! Nice work',
+    idle: [
+      'Still here if you need me',
+      'Tiny crab, big plans',
+      'Snip snap, ready when you are',
+      'Stretching my claws…',
+      'I polished the progress bar',
+      'Sideways is my favorite direction',
+      'You’re doing great',
+      'Counting bubbles… 41, 42…',
+    ],
   },
   ru: {
     pane: 'Агенты',
@@ -108,6 +129,20 @@ const STRINGS = {
     ctx: 'ctx',
     tier: { light: 'light', medium: 'medium', careful: 'careful', heavy: 'heavy', fable: 'fable', other: 'other' },
     effort: { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
+    planReady: 'План готов',
+    taskDone: 'Готово',
+    taskFailed: 'Что-то пошло не так',
+    allDone: 'Всё готово! Отличная работа',
+    idle: [
+      'Я тут, если что',
+      'Маленький краб, большие планы',
+      'Щёлк-щёлк, жду команды',
+      'Разминаю клешни…',
+      'Я протёр прогресс-бар',
+      'Боком ходить удобнее',
+      'У тебя отлично получается',
+      'Считаю пузырьки… 41, 42…',
+    ],
   },
   he: {
     pane: 'סוכנים',
@@ -139,6 +174,20 @@ const STRINGS = {
     ctx: 'הקשר',
     tier: { light: 'קל', medium: 'בינוני', careful: 'זהיר', heavy: 'כבד', fable: 'פייבל', other: 'אחר' },
     effort: { low: 'נמוך', medium: 'בינוני', high: 'גבוה', xhigh: 'גבוה מאוד', max: 'מקסימלי' },
+    planReady: 'התוכנית מוכנה',
+    taskDone: 'הושלם',
+    taskFailed: 'משהו השתבש',
+    allDone: 'הכול מוכן! עבודה יפה',
+    idle: [
+      'אני כאן אם צריך',
+      'סרטן קטן, תוכניות גדולות',
+      'קליק-קלאק, מוכן כשאתם מוכנים',
+      'מותח את הצבתות…',
+      'ניקיתי את פס ההתקדמות',
+      'הצידה זה הכיוון האהוב עליי',
+      'אתם עושים עבודה מצוינת',
+      'סופר בועות… 41, 42…',
+    ],
   },
 } as const
 
@@ -227,32 +276,24 @@ const label = (f: Flow): string => {
 
 const ratio = (f: Flow): number => (f.isFinished ? 1 : f.total ? f.done / f.total : 0)
 
-// Deterministic noise so the dither does not shimmer between redraws.
-const noise = (x: number, y: number): number => {
-  const s = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453
-  return s - Math.floor(s)
-}
-
 // The whole row is one SVG: the desktop wraps sibling elements onto new lines,
 // so title, bar, percent and the crab live in one drawing; only the count and
 // the dismiss are Buttons beside it.
-// Arcade look: a framed, segmented HP bar (one block per task when there are
-// few), coins in the blocks still to win, a goal flag at the end, and Clawd
-// running along the top of the bar at the fill's head.
-const H = 40
-const BAR_H = 14
+// HUD look: a thin glowing bar between corner brackets over a ruler, a reticle
+// before the title, and Clawd standing at the fill's head. Nothing moves unless
+// a worker is running: then the crab walks, the reticle turns, a scan line
+// sweeps the fill and the blocks handed to workers march.
+const H = 38
+const BAR_H = 8
 // The bar's top edge: the crab's feet stand on it.
 const BAR_Y = 24
 // The crab's drawing grid is 30 units wide, props included.
 const CRAB_BOX = 30
-const BAND_CRAB = 0.85
+const BAND_CRAB = 0.7
 const FONT = "-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-serif"
-const PIX = "'Press Start 2P','Silkscreen','Cascadia Mono',Consolas,ui-monospace,monospace"
-const COIN = '#F5C542'
-const COIN_HI = '#FBE08A'
+const HUD = "'Cascadia Mono','SF Mono',Consolas,ui-monospace,monospace"
 // Up to this many tasks, each task is one block of the bar.
 const MAX_BLOCKS = 24
-
 const xml = (s: string): string =>
   s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c] ?? c)
 
@@ -280,126 +321,150 @@ const fitText = (s: string, size: number, maxW: number): string => {
   return out + '…'
 }
 
-// A rectangle with its four corner pixels cut off, the way old consoles drew boxes.
-const notched = (x: number, y: number, w: number, h: number, cls: string): string =>
-  `<path class="${cls}" d="M${x + 1} ${y}h${w - 2}v1h1v${h - 2}h-1v1h${-(w - 2)}v-1h-1v${-(h - 2)}h1z"/>`
-
-// A 5×5 pixel heart, drawn in 2px cells.
-const HEART = ['.x.x.', 'xxxxx', 'xxxxx', '.xxx.', '..x..']
-const heart = (x: number, y: number, color: string): string =>
-  HEART.flatMap((row, r) => [...row].map((ch, c) => (ch === 'x' ? `<rect x="${x + c * 2}" y="${y + r * 2}" width="2" height="2" fill="${color}"/>` : ''))).join('')
-
-const rowSvg = (f: Flow, W: number, isWorking: boolean): string => {
+// `speech` is what Clawd says in a bubble beside it, if anything.
+const rowSvg = (f: Flow, W: number, isWorking: boolean, speech = ''): string => {
   // Positions are worked out left to right; right to left mirrors each box
   // inside the bar (`bx`) and across the row (`rx`). Text is never mirrored.
   const rtl = isRtl()
   const rx = (x: number, w: number): number => (rtl ? W - x - w : x)
+  // Motion only while something is going on.
+  const live = isWorking && !f.isFinished
 
-  // Pixel type runs wide: the title takes up to a third of the row.
-  const title = fitText(f.title.toUpperCase(), 11, Math.max(60, W * 0.33))
+  const title = fitText(f.title.toUpperCase(), 10, Math.max(60, W * 0.3))
+  // Letter-spaced HUD type: 1.5px after every character.
+  const spaced = (s: string, size: number): number => textWidth(s, size) + [...s].length * 1.5
   const hud = label(f).toUpperCase()
-  const percent = `${Math.round(ratio(f) * 100)}%`
-  const slotW = Math.round(Math.max(44, textWidth(hud, 9) + 6, textWidth(percent, 11) + 6))
-  const FLAG_W = 12
-  const BAR_X = Math.round(16 + textWidth(title, 11) + 12)
-  const BAR_W = Math.max(80, W - BAR_X - FLAG_W - slotW - 6)
+  const percent = `${Math.round(ratio(f) * 100)}`
+  const slotW = Math.round(Math.max(52, spaced(hud, 9) + 8))
+  const BAR_X = Math.round(20 + spaced(title, 10) + 14)
+  const BAR_W = Math.max(80, W - BAR_X - slotW - 12)
   const bx = (x: number, w: number): number => (rtl ? BAR_W - x - w : x)
-  const color = f.isFinished ? DONE : ACCENT
 
-  // Blocks: one per task when there are few, else even 8px chunks.
-  const inner = BAR_W - 4
+  // Blocks: one per task when there are few, else even 6px chunks.
+  const inner = BAR_W - 6
   const gap = 2
   const perTask = f.total > 0 && f.total <= MAX_BLOCKS
-  const segs = perTask ? f.total : Math.max(4, Math.floor(inner / 8))
+  const segs = perTask ? f.total : Math.max(4, Math.floor(inner / 6))
   const segW = (inner - gap * (segs - 1)) / segs
   const filled = Math.round(segs * ratio(f))
-  // Handed to workers, not yet accepted: blocks that blink.
+  // Handed to workers, not yet accepted: outlined blocks.
   const runTo = f.total ? Math.max(filled, Math.round((segs * Math.min(f.total, f.done + f.running)) / f.total)) : filled
-  const blocks: string[] = []
+  const on: string[] = []
+  const rest: string[] = []
   for (let i = 0; i < segs; i++) {
-    const x = bx(2 + i * (segW + gap), segW)
+    const x = bx(3 + i * (segW + gap), segW)
     const w = segW.toFixed(2)
-    if (i < filled) {
-      const head = i === filled - 1 && !f.isFinished ? ' class="hd"' : ''
-      blocks.push(
-        `<g${head}><rect x="${x}" y="2" width="${w}" height="${BAR_H - 4}" fill="${color}"/>` +
-          `<rect x="${x}" y="2" width="${w}" height="2" fill="#fff" opacity=".4"/>` +
-          `<rect x="${x}" y="${BAR_H - 4}" width="${w}" height="2" fill="#000" opacity=".22"/></g>`,
-      )
-    } else if (i < runTo) {
-      blocks.push(`<rect class="bk" x="${x}" y="2" width="${w}" height="${BAR_H - 4}" fill="${color}" opacity=".45"/>`)
-    } else {
-      blocks.push(`<rect class="e" x="${x}" y="2" width="${w}" height="${BAR_H - 4}"/>`)
-      // A coin waits in each task still to win.
-      if (perTask && segW >= 6) {
-        const cx = x + segW / 2 - 2
-        blocks.push(`<g class="cn"><rect x="${cx.toFixed(2)}" y="3" width="4" height="6" fill="${COIN}"/><rect x="${(cx + 1).toFixed(2)}" y="4" width="1" height="3" fill="${COIN_HI}"/></g>`)
-      }
+    if (i < filled) on.push(`<rect class="on" x="${x.toFixed(2)}" y="2" width="${w}" height="${BAR_H - 4}"/>`)
+    else if (i < runTo) rest.push(`<rect class="rn${live ? ' mv' : ''}" x="${(x + 0.5).toFixed(2)}" y="2.5" width="${(segW - 1).toFixed(2)}" height="${BAR_H - 5}"/>`)
+    else rest.push(`<rect class="off" x="${x.toFixed(2)}" y="${BAR_H / 2 - 0.5}" width="${w}" height="1"/>`)
+  }
+  const fillW = filled ? filled * (segW + gap) - gap : 0
+  const headX = 3 + fillW
+
+  // Corner brackets in place of a box, and a ruler underneath: a tick every 10%.
+  const bracket = (x: number, y: number, dx: number, dy: number): string => `<path class="ln" d="M${x + dx * 6} ${y}H${x}V${y + dy * 3}"/>`
+  const frame = [bracket(0.5, 0.5, 1, 1), bracket(BAR_W - 0.5, 0.5, -1, 1), bracket(0.5, BAR_H - 0.5, 1, -1), bracket(BAR_W - 0.5, BAR_H - 0.5, -1, -1)].join('')
+  const ruler = Array.from({ length: 11 }, (_, k) => `<rect class="tk" x="${bx((k * (BAR_W - 1)) / 10, 1).toFixed(2)}" y="${BAR_H + 2}" width="1" height="${k % 5 ? 1.5 : 3}"/>`).join('')
+  // The head: a hairline through the bar at the fill's edge.
+  const head = filled && !f.isFinished ? `<rect class="ac${live ? ' hd' : ''}" x="${bx(headX, 1).toFixed(2)}" y="-2" width="1" height="${BAR_H + 4}"/>` : ''
+  // A light sweeping the fill, left to right (right to left in Hebrew).
+  const SCAN = 28
+  const scan =
+    live && fillW > 12
+      ? `<clipPath id="fc"><rect x="${bx(3, fillW).toFixed(2)}" y="0" width="${fillW.toFixed(2)}" height="${BAR_H}"/></clipPath>
+<g clip-path="url(#fc)"><rect class="sc" x="0" y="2" width="${SCAN}" height="${BAR_H - 4}" fill="url(#sg)"/></g>`
+      : ''
+  const scanFrom = rtl ? BAR_W - 3 : 3 - SCAN
+  const scanTo = rtl ? BAR_W - 3 - fillW - SCAN : 3 + fillW
+
+  // Clawd stands on the bar at the fill's head; at the end once finished.
+  const crabW = CRAB_BOX * BAND_CRAB
+  const crabX = Math.max(0, Math.min(BAR_W - crabW, headX - crabW / 2))
+  // Legs end on grid row 26: lift the crab so its feet touch the bar's top.
+  const crabY = BAR_Y - 26 * BAND_CRAB - 1
+  const crabRowX = BAR_X + bx(crabX, crabW)
+
+  // The speech bubble sits beside Clawd's head, on the side it faces when there
+  // is room (right; left in Hebrew), else the other side; never over the readout.
+  let bubble = ''
+  if (speech) {
+    const PAD = 6
+    const size = 9.5
+    const room = { right: W - slotW - 8 - (crabRowX + crabW + 4), left: crabRowX - 4 }
+    const want = rtl ? 'left' : 'right'
+    const side = room[want] >= Math.min(textWidth(speech, size) + PAD * 2, 140) || room[want] >= room[want === 'left' ? 'right' : 'left'] ? want : want === 'left' ? 'right' : 'left'
+    const text = fitText(speech, size, Math.max(0, room[side] - PAD * 2))
+    if (room[side] > 40) {
+      const bw = Math.ceil(textWidth(text, size) + PAD * 2)
+      const by = 1
+      const bh = 15
+      const x0 = side === 'right' ? crabRowX + crabW + 4 : crabRowX - 4 - bw
+      // The tail points down at Clawd's head.
+      const tx = side === 'right' ? x0 : x0 + bw
+      const dir = side === 'right' ? -1 : 1
+      bubble = `<g class="pop" style="transform-origin:${side === 'right' ? 0 : 100}% 100%">
+<path class="bb" d="M${tx} ${by + bh - 6}l${dir * 5} 6l${-dir * 0.5}-8z"/>
+<rect class="bb" x="${x0}" y="${by}" width="${bw}" height="${bh}" rx="5"/>
+<text class="t" x="${x0 + bw / 2}" y="${by + bh / 2 + 3.3}" text-anchor="middle"${rtl ? ' direction="rtl"' : ''} font-family="${HUD}" font-size="${size}">${xml(text)}</text>
+</g>`
     }
   }
 
-  // Clawd stands on the bar at the fill's head; at the goal once finished.
-  const crabW = CRAB_BOX * BAND_CRAB
-  const headX = filled ? 2 + filled * (segW + gap) - gap : 0
-  const crabX = Math.max(0, Math.min(BAR_W - crabW, headX - crabW / 2))
-  const crabRowX = BAR_X + bx(crabX, crabW)
-  // Legs end on grid row 26: lift the crab so its feet touch the bar's top.
-  const crabY = BAR_Y - 26 * BAND_CRAB
-  const sparkles = f.isFinished
-    ? [0, 1, 2]
-        .map(i => {
-          const sx = crabRowX + (i === 0 ? -4 : i === 1 ? crabW + 2 : crabW / 2 + (noise(i, 3) - 0.5) * 6)
-          const sy = crabY + (i === 2 ? 2 : 8 + i * 4)
-          return `<g class="sp" style="animation-delay:${-i * 0.15}s" fill="${COIN}"><rect x="${sx}" y="${sy + 1}" width="3" height="1"/><rect x="${sx + 1}" y="${sy}" width="1" height="3"/></g>`
-        })
-        .join('')
-    : ''
-
-  // The goal flag stands just past the bar's end.
-  const flagX = rx(BAR_X + BAR_W + 4, 7)
-  const flagY = BAR_Y - 12
-  const flag = `<rect class="t" x="${rtl ? flagX + 6 : flagX}" y="${flagY}" width="1" height="${BAR_H + 12}"/>
-<g class="fl"${rtl ? ' style="transform-origin:100% 50%"' : ''}>${['wkw', 'kwk']
-    .flatMap((row, r) => [...row].map((ch, c) => `<rect x="${(rtl ? flagX : flagX + 1) + c * 2}" y="${flagY + r * 2}" width="2" height="2" fill="${ch === 'w' ? '#F8F6F1' : f.isFinished ? DONE : INK}"/>`))
-    .join('')}</g>`
-
+  const midY = BAR_Y + BAR_H / 2
+  const cx = rtl ? W - 6 : 6
   // `direction="rtl"` puts Hebrew words and numbers in reading order; `start` is then the right edge.
-  const midY = BAR_Y + BAR_H / 2 + 4
-  const titleAt = rtl ? `x="${W - 16}" direction="rtl" text-anchor="start"` : 'x="16"'
-  const slotAnchor = rtl ? '' : ' text-anchor="end"'
-  const slotEdge = rtl ? 0 : W
+  const titleAt = rtl ? `x="${W - 20}" direction="rtl" text-anchor="start"` : 'x="20"'
+  const slotAt = rtl ? 'x="0"' : `x="${W}" text-anchor="end"`
 
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
 <style>
-.t{fill:#1f1f1f}.m{fill:#77756f}.fr{fill:#1f1e1d}.tr{fill:#34332f}.e{fill:#48463f}
-@media (prefers-color-scheme: dark){.t{fill:#ececec}.m{fill:#a8a6a0}.fr{fill:#8a8882}.tr{fill:#121211}.e{fill:#2a2a28}}
-.hd,.bk,.sp{animation:bl .5s steps(1) infinite}.bk{animation-duration:1s}.sp{animation-duration:.4s}
-@keyframes bl{50%{opacity:.4}}
-.cn{transform-box:fill-box;transform-origin:50% 50%;animation:spin 1s steps(1) infinite}
-@keyframes spin{25%,75%{transform:scaleX(.5)}50%{transform:scaleX(.2)}}
-.fl{transform-box:fill-box;transform-origin:0 50%;animation:fw .5s steps(1) infinite}
-@keyframes fw{50%{transform:skewY(-15deg)}}
-@media (prefers-reduced-motion: reduce){.hd,.bk,.sp,.cn,.fl{animation:none}}
+.hud,.bb{--c:#1E6FD9;--k:#cfd3dc}.g0{stop-color:#1E88E5}.g1{stop-color:#7C4DFF}
+.ok{--c:#10B981}.ok .g0{stop-color:#10B981}.ok .g1{stop-color:#06B6D4}
+.t{fill:#1f1f1f}.s{fill:#8a8a86}.bb{fill:#fff;stroke:var(--c);stroke-opacity:.55}
+@media (prefers-color-scheme: dark){.hud,.bb{--c:#5CC8FF;--k:#2f3446}.g0{stop-color:#4FC3F7}.g1{stop-color:#A78BFA}
+.ok{--c:#34D399}.ok .g0{stop-color:#34D399}.ok .g1{stop-color:#22D3EE}
+.t{fill:#ececec}.s{fill:#8f8f8a}.bb{fill:#101829}}
+.on{fill:url(#bg)}.ac{fill:var(--c)}.rn{fill:none;stroke:var(--c);stroke-opacity:.6}.off,.tk{fill:var(--k)}.ln,.rt,.ri{fill:none;stroke:var(--c);stroke-opacity:.6}.ri{stroke-opacity:.9}
+.pop{transform-box:fill-box;animation:pop .25s ease-out 1}@keyframes pop{from{transform:scale(.5);opacity:0}}
+@media (prefers-reduced-motion: reduce){.pop{animation:none}}
+${
+  live
+    ? `.go .mv{stroke-dasharray:3 2;animation:da 1s linear infinite}@keyframes da{to{stroke-dashoffset:-5}}
+.go .rt{transform-box:fill-box;transform-origin:50% 50%;animation:rot 6s linear infinite}@keyframes rot{to{transform:rotate(360deg)}}
+.go .ri{transform-box:fill-box;transform-origin:50% 50%;animation:rot 3s linear infinite reverse}
+.go .sc{animation:sw 2.4s linear infinite}@keyframes sw{from{transform:translateX(${scanFrom}px)}to{transform:translateX(${scanTo}px)}}
+.go .hd{animation:hp 1.2s ease-in-out infinite}@keyframes hp{50%{opacity:.35}}
+@media (prefers-reduced-motion: reduce){.go .mv,.go .rt,.go .ri,.go .sc,.go .hd{animation:none}}`
+    : ''
+}
 </style>
-${heart(rtl ? W - 10 : 0, BAR_Y + 1, CLAY)}
-<text class="t" ${titleAt} y="${midY}" font-family="${PIX}" font-size="11" font-weight="700" letter-spacing=".5">${xml(title)}</text>
+<defs>
+<filter id="gl" x="-10%" y="-150%" width="120%" height="400%"><feGaussianBlur stdDeviation="1.6" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+<linearGradient id="bg"${f.isFinished ? ' class="ok"' : ''} gradientUnits="userSpaceOnUse" x1="${rtl ? BAR_W : 0}" y1="0" x2="${rtl ? 0 : BAR_W}" y2="0"><stop class="g0" offset="0"/><stop class="g1" offset="1"/></linearGradient>
+<linearGradient id="sg"><stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset=".5" stop-color="#fff" stop-opacity=".75"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+</defs>
+<g class="hud${f.isFinished ? ' ok' : ''}${live ? ' go' : ''}">
+<circle class="rt" cx="${cx}" cy="${midY}" r="6" stroke-dasharray="7 2.42"/>
+<circle class="ri" cx="${cx}" cy="${midY}" r="3.6" stroke-dasharray="11 11.6"/>
+<circle class="ac" cx="${cx}" cy="${midY}" r="1.3"/>
+<text class="t" ${titleAt} y="${midY + 3.5}" font-family="${HUD}" font-size="10" letter-spacing="1.5">${xml(title)}</text>
 <g transform="translate(${rx(BAR_X, BAR_W)},${BAR_Y})">
-${notched(0, 0, BAR_W, BAR_H, 'fr')}
-${notched(1, 1, BAR_W - 2, BAR_H - 2, 'tr')}
-${blocks.join('')}
+${frame}${ruler}${rest.join('')}
+<g filter="url(#gl)">${on.join('')}${head}</g>
+${scan}
 </g>
-${flag}
-<text class="m" x="${rtl ? 0 : slotEdge}"${slotAnchor} y="${BAR_Y - 5}" font-family="${PIX}" font-size="9" font-weight="700"${rtl ? ' direction="rtl" text-anchor="end"' : ''}>${xml(hud)}</text>
-<text class="t" x="${rtl ? 0 : slotEdge}"${slotAnchor} y="${midY}" font-family="${PIX}" font-size="11" font-weight="700" font-variant-numeric="tabular-nums">${percent}</text>
-${CRAB_CSS}${crab(crabRowX, crabY, 'other', false, isWorking && !f.isFinished, BAND_CRAB, rtl)}
-${sparkles}
+<text class="s" ${slotAt} y="${BAR_Y - 6}" font-family="${HUD}" font-size="9" letter-spacing="1.5"${rtl ? ' direction="rtl" text-anchor="end"' : ''}>${xml(hud)}</text>
+<text class="t" ${slotAt} y="${BAR_Y + BAR_H + 4}" font-family="${HUD}" font-size="14" font-weight="300" font-variant-numeric="tabular-nums">${percent}<tspan class="s" font-size="9">%</tspan></text>
+</g>
+${CRAB_CSS}${crab(crabRowX, crabY, 'other', false, live, BAND_CRAB, rtl)}
+${bubble}
 </svg>`
 }
 
-// Terminal: chunky blocks, like a health bar.
+// Terminal: a thin HUD line.
 const barText = (f: Flow, width: number): string => {
   const filled = Math.round(width * ratio(f))
-  return '▰'.repeat(filled) + '▱'.repeat(Math.max(0, width - filled))
+  return '━'.repeat(filled) + '─'.repeat(Math.max(0, width - filled))
 }
 
 // ---------------------------------------------------------------------------
@@ -556,7 +621,9 @@ const PANE_CSS = `<style>
 .t{fill:#1f1f1f}.s{fill:#6b6b68}.m{fill:#9a9a96}.k{fill:#ecebe8}.ln{stroke:#e4e4e1}.tile{fill:#f4f3f0}
 @media (prefers-color-scheme: dark){.t{fill:#ececec}.s{fill:#a8a8a4}.m{fill:#7d7d79}.k{fill:#2c2c2b}.ln{stroke:#333331}.tile{fill:#262625}}
 .live{animation:p 1.6s ease-in-out infinite}@keyframes p{50%{opacity:.3}}
-@media (prefers-reduced-motion: reduce){.live{animation:none}}
+.spin{transform-box:fill-box;transform-origin:50% 50%;animation:rot 6s linear infinite}.rev{animation-duration:3s;animation-direction:reverse}
+@keyframes rot{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion: reduce){.live,.spin{animation:none}}
 </style>`
 
 // Pixel Clawd from DockCrab (Clawdy): a 24×18 crab on a 30×28 grid, one costume per tier.
@@ -707,9 +774,23 @@ const endText = (W: number, x: number, y: number, words = false): string =>
 
 const crabWidth = (scale: number): number => Math.round(CRAB_BOX * scale * 100) / 100
 
-// A panel crab at x in a row of width W: on the mirrored side and facing left in Hebrew.
-const rowCrab = (W: number, x: number, y: number, costume: string, dim = false, isWalking = false): string =>
-  crab(mx(W, x, crabWidth(CRAB_SCALE)), y, costume, dim, isWalking, CRAB_SCALE, isRtl())
+// The band's Clawd is the only crab: a panel row gets a HUD ring badge in its
+// tier's color at x, in the box a crab used to fill; on the mirrored side in
+// Hebrew. Its rings turn only while the agent runs.
+const rowBadge =(W: number, x: number, y: number, costume: string, dim = false, isRunning = false): string => {
+  const box = crabWidth(CRAB_SCALE)
+  const cx = mx(W, x, box) + box / 2
+  const cy = y + 19
+  const color = colorOf(costume)
+  const spin = isRunning ? ' class="spin"' : ''
+  const back = isRunning ? ' class="spin rev"' : ''
+  return `<g opacity="${dim ? 0.45 : 1}" fill="none" stroke="${color}">
+<circle cx="${cx}" cy="${cy}" r="10" stroke-opacity=".25"/>
+<circle${spin} cx="${cx}" cy="${cy}" r="10" stroke-width="1.5" stroke-dasharray="12 3.7"/>
+<circle${back} cx="${cx}" cy="${cy}" r="6" stroke-dasharray="14 4.85" stroke-opacity=".8"/>
+<circle cx="${cx}" cy="${cy}" r="2.2" fill="${color}" stroke="none"/>
+</g>`
+}
 
 const svg = (W: number, H: number, body: string): string =>
   `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">${PANE_CSS}${CRAB_CSS}${body}</svg>`
@@ -758,21 +839,21 @@ const agentSvg = (W: number, a: AgentRun, at: number): string => {
   const steps = a.stepTotal ? `${a.stepDone ?? 0}/${a.stepTotal}${a.stepNote ? ' · ' + a.stepNote : ''}` : ''
   const stepsW = Math.max(0, barW - textWidth(stats, 11) - 12)
   // Without reported steps the bar falls back to the context, drawn grey.
-  // Arcade blocks: one per reported step when there are few, else 9px chunks.
-  const segs = a.stepTotal && a.stepTotal <= 20 && progress !== null ? a.stepTotal : Math.max(4, Math.min(40, Math.floor(barW / 9)))
+  // HUD blocks: one per reported step when there are few, else 7px chunks; the rest a hairline.
+  const segs = a.stepTotal && a.stepTotal <= 20 && progress !== null ? a.stepTotal : Math.max(4, Math.min(60, Math.floor(barW / 7)))
   const segW = (barW - 2 * (segs - 1)) / segs
   const lit = Math.round(segs * (progress ?? ctx / 100))
   const blocks = Array.from({ length: segs }, (_, i) => {
     const x = mx(W, 42 + i * (segW + 2), segW).toFixed(2)
     const w = segW.toFixed(2)
-    if (i >= lit) return `<rect class="k" x="${x}" y="54" width="${w}" height="6"/>`
+    if (i >= lit) return `<rect class="k" x="${x}" y="56.5" width="${w}" height="1"/>`
     const fill = progress === null ? ' class="m"' : ` fill="${color}"`
-    return `<rect${fill} x="${x}" y="54" width="${w}" height="6"/><rect x="${x}" y="54" width="${w}" height="2" fill="#fff" opacity=".35"/>`
+    return `<rect${fill} x="${x}" y="55" width="${w}" height="4"/>`
   }).join('')
   return svg(
     W,
     66,
-    `${rowCrab(W, 0, 14, costumeOf(a.type), false, a.status === 'running')}
+    `${rowBadge(W, 0, 14, costumeOf(a.type), false, a.status === 'running')}
 <text class="t" ${startText(W, 42, 18)} font-family="${FONT}" font-size="13" font-weight="600">${xml(fitText(a.description || a.type, 13, textW))}</text>
 <text ${startText(W, 42, 34)} font-family="${FONT}" font-size="11"><tspan fill="${color}">${xml(tier === 'other' ? a.type : tierWord(tier))}</tspan><tspan class="s">  ${xml(meta.join('  ·  '))}</tspan></text>
 ${steps && stepsW > 30 ? `<text class="t" ${startText(W, 42, 49)} font-family="${FONT}" font-size="11" font-variant-numeric="tabular-nums">${xml(fitText(steps, 11, stepsW))}</text>` : ''}
@@ -792,7 +873,7 @@ const plannedSvg = (W: number, p: Planned): string => {
   return svg(
     W,
     46,
-    `${rowCrab(W, 0, 6, tier, true)}
+    `${rowBadge(W, 0, 6, tier, true)}
 <text class="s" ${startText(W, 42, 18)} font-family="${FONT}" font-size="13" font-weight="600">${xml(fitText(`${p.n}. ${p.title}`, 13, textW))}</text>
 <text ${startText(W, 42, 34)} font-family="${FONT}" font-size="11"><tspan fill="${color}">${xml(tierWord(tier))}</tspan><tspan class="m">  ${xml(meta.filter(Boolean).join('  ·  '))}</tspan></text>
 ${statusMark(mx(W, W - 8), 16, 'planned', color)}
@@ -810,7 +891,7 @@ const compactSvg = (W: number, list: AgentRun[], planned: Planned[], t: ReturnTy
   const shown = icons.slice(0, fit)
   const more = icons.length - shown.length
   const body = shown
-    .map((ic, i) => rowCrab(W, i * 36, 0, ic.k, ic.dim, ic.s === 'running') + (ic.s === 'running' ? `<circle class="live" cx="${mx(W, i * 36 + 32)}" cy="4" r="3" fill="${ic.c}"/>` : ''))
+    .map((ic, i) => rowBadge(W, i * 36, 0, ic.k, ic.dim, ic.s === 'running') + (ic.s === 'running' ? `<circle class="live" cx="${mx(W, i * 36 + 32)}" cy="4" r="3" fill="${ic.c}"/>` : ''))
     .join('')
   const x = shown.length * 36 + (more ? 4 : 0)
   return svg(
@@ -825,7 +906,7 @@ const compactSvg = (W: number, list: AgentRun[], planned: Planned[], t: ReturnTy
 
 const ctxBar = (pct: number, width: number): string => {
   const filled = Math.round((width * pct) / 100)
-  return '▰'.repeat(filled) + '▱'.repeat(Math.max(0, width - filled))
+  return '━'.repeat(filled) + '─'.repeat(Math.max(0, width - filled))
 }
 
 const STATUS_GLYPH: Record<string, string> = { running: '●', done: '✓', failed: '✗', planned: '◷' }
@@ -848,6 +929,26 @@ async function autoOpen($: EngineInterface, key: string): Promise<void> {
   if (p.autoOpenedFor === key) return
   await update($, panel, prev => ({ ...prev, autoOpenedFor: key }))
   void $.ui.open({ id: PANE, title: tr().pane })
+}
+
+// Clawd says `text` in the band's bubble for SAY_MS.
+async function speak($: EngineInterface, text: string): Promise<void> {
+  const at = await $.clock.now()
+  await update($, say, () => ({ text: clip(text, 60), at }))
+  await update($, spokeAt, () => at)
+}
+
+// Once a second: take the bubble down when its time is up, and when the band is
+// up with nothing running and Clawd has been quiet for IDLE_MS, say something.
+async function tickSpeech($: EngineInterface): Promise<void> {
+  const at = await $.clock.now()
+  const said = await read($, say)
+  if (said && at - said.at >= SAY_MS) await update($, say, () => null)
+  const f = await read($, flow)
+  if (!f || (await read($, agents)).some(a => a.status === 'running')) return
+  if (at - (await read($, spokeAt)) < IDLE_MS) return
+  const lines = tr().idle
+  await speak($, lines[Math.floor(at / IDLE_MS) % lines.length] ?? '')
 }
 
 export const register: Register = (on, options) => {
@@ -909,15 +1010,19 @@ export const register: Register = (on, options) => {
       description: 'Show or hide the panel of subagents: running, finished and planned, with model, context, cost and time',
     })
 
-    // Ticks the running agents' clocks; quiet when nothing runs.
+    // Ticks the running agents' clocks; quiet when nothing runs. Also times Clawd's bubble.
     $.clock.every(1000, () => {
       void (async () => {
+        await tickSpeech($)
         const list = await read($, agents)
         if (!list.some(a => a.status === 'running')) return
         const at = await $.clock.now()
         await update($, now, () => at)
       })()
     })
+    // A fresh session starts the idle wait now, not at once.
+    const startedAt = await $.clock.now()
+    await update($, spokeAt, prev => prev || startedAt)
     return started
   })
 
@@ -945,6 +1050,8 @@ export const register: Register = (on, options) => {
     }
     const next = await update($, flow, p => merge(p, input))
     if (next && input.tasks?.length) await autoOpen($, next.title)
+    if (next?.isFinished && !prev?.isFinished) await speak($, tr().allDone)
+    else if (next && input.tasks?.length) await speak($, `${tr().planReady} · ${next.total} ${tr().tasks.toLowerCase()}`)
     return { result: `ok: ${label(next ?? blank())}` }
   })
 
@@ -1083,6 +1190,13 @@ export const register: Register = (on, options) => {
         }),
       )
       await update($, now, () => at)
+      // Clawd calls out a finished or failed agent by its task.
+      const run = (await read($, agents)).find(a => a.agentId === agentId)
+      if (run) {
+        const s = tr()
+        const what = clip(run.description || run.type, 32)
+        await speak($, run.status === 'done' ? `${s.taskDone}: ${what}` : `${s.taskFailed}: ${what}`)
+      }
     }
     return next(e)
   })
@@ -1275,6 +1389,8 @@ export const register: Register = (on, options) => {
     const list = await read($, agents)
     const crew = list.length + plannedOf(f, list).length
     const isWorking = list.some(a => a.status === 'running')
+    const said = await read($, say)
+    const speech = said && (await $.clock.now()) - said.at < SAY_MS ? said.text : ''
     const crewButton = (
       <Button key="savvy-agents" label={`×${crew}`} plain onPress={() => void togglePane($)} />
     )
@@ -1298,7 +1414,7 @@ export const register: Register = (on, options) => {
       return (
         <Box flexDirection="column">
           <Box flexDirection={isRtl() ? 'row-reverse' : 'row'} alignItems="center" gap={1}>
-            <Svg source={rowSvg(f, width, isWorking)} alt={`${f.title}: ${label(f)}, ${percent}`} width={width} height={H} />
+            <Svg source={rowSvg(f, width, isWorking, speech)} alt={`${f.title}: ${label(f)}, ${percent}${speech ? `. Clawd: ${speech}` : ''}`} width={width} height={H} />
             {crewButton}
             {dismiss}
           </Box>
@@ -1324,6 +1440,12 @@ export const register: Register = (on, options) => {
           {crewButton}
           {dismiss}
         </Box>
+        {speech ? (
+          <Text wrap="truncate-end">
+            <Text color={CLAY}>▣ </Text>
+            <Text dimColor>“{speech}”</Text>
+          </Text>
+        ) : null}
         {below}
       </Box>
     )
